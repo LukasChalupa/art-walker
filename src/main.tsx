@@ -83,6 +83,8 @@ type MatchTiming = {
   routeMs: number;
   placements?: number;
   rankedRoutes?: number;
+  selectedRouteRank?: number;
+  choicePoolSize?: number;
   startOffsetMeters?: number;
 };
 
@@ -149,10 +151,10 @@ const defaultLocation: LocationSuggestion = {
 const templates = [
   "heart",
   "star",
-  "flower",
+  "diamond",
   "mountains",
   "spiral",
-  "cat",
+  "crown",
   "bolt",
   "wave",
 ] as const;
@@ -171,16 +173,16 @@ const matchConfig = {
   graphCacheVersion: "fast-road-profile-cache-v1",
   roadNodeSpacingMeters: 20,
   maxRenderedSegmentMeters: 10,
-  targetPoints: 40,
-  topCandidates: 56,
+  targetPoints: 48,
+  topCandidates: 84,
   minRoadSearchRadiusMeters: 700,
   maxRoadSearchRadiusMeters: 3200,
   roadSearchPaddingMeters: 220,
   compactRoadMinSegments: 80,
   compactRoadRadiusBoost: 1.18,
-  startSearchRadiusRatio: 0.14,
-  minStartSearchRadiusMeters: 180,
-  maxStartSearchRadiusMeters: 900,
+  startSearchRadiusRatio: 0.18,
+  minStartSearchRadiusMeters: 220,
+  maxStartSearchRadiusMeters: 1200,
   scales: [0.78, 0.86, 0.94, 1, 1.08, 1.16],
   rotations: [
     0,
@@ -194,35 +196,45 @@ const matchConfig = {
     -Math.PI / 2,
     Math.PI,
   ],
-  preferredRotationRadians: Math.PI / 6,
-  rotationPenaltyWeight: 90,
+  preferredRotationRadians: Math.PI / 4,
+  rotationPenaltyWeight: 45,
   pathBudgetFactor: 2.55,
   pathBudgetPaddingMeters: 180,
   minPathBudgetMeters: 200,
   minSegmentBudgetMeters: 620,
   segmentBudgetDivisor: 7.5,
+  distancePenaltyWeight: 0.04,
+  shortRoutePenaltyWeight: 0.3,
+  minRouteDistanceRatio: 0.55,
   heuristicWeight: 1.25,
   shapeVariantLimit: 6,
   shapeVariantPenalty: 520,
   randomCandidatesPerVariant: 520,
   randomScaleMin: 0.66,
   randomScaleMax: 1.32,
-  waypointLookahead: 7,
-  stitchBeamWidth: 3,
-  futureFitLookahead: 3,
-  futureFitPenalty: 0.12,
-  startDriftPenalty: 0.025,
+  routeChoicePoolSize: 8,
+  routeChoiceScoreWindowRatio: 0.2,
+  routeChoiceMinScoreWindow: 280,
+  routeChoiceScoreSharpness: 1.1,
+  waypointLookahead: 5,
+  stitchBeamWidth: 5,
+  futureFitLookahead: 4,
+  futureFitPenalty: 0.22,
+  snapPenaltyWeight: 1.35,
+  jumpPenaltyWeight: 1.15,
+  duplicateWaypointPenalty: 115,
+  startDriftPenalty: 0.018,
   outsideStartPenalty: 0.25,
-  stitchedStartPenalty: 0.015,
+  stitchedStartPenalty: 0.012,
   gentleTurnRadians: Math.PI / 5,
-  turnPenaltyWeight: 34,
-  uTurnPenalty: 420,
-  repeatedEdgePenalty: 180,
-  reverseEdgePenalty: 320,
-  deadEndPenalty: 260,
+  turnPenaltyWeight: 7,
+  uTurnPenalty: 85,
+  repeatedEdgePenalty: 34,
+  reverseEdgePenalty: 105,
+  deadEndPenalty: 56,
   pathCacheBudgetStepMeters: 80,
-  maxSkippedWaypointRatio: 0.85,
-  skippedWaypointPenalty: 260,
+  maxSkippedWaypointRatio: 0.62,
+  skippedWaypointPenalty: 420,
 };
 
 const roadQueryProfiles = {
@@ -245,12 +257,12 @@ const roadQueryProfiles = {
 } satisfies Record<string, RoadQueryProfile>;
 
 const templateAlternates: Record<TemplateName, TemplateName[]> = {
-  heart: ["flower", "spiral", "wave"],
-  star: ["flower", "bolt", "spiral"],
-  flower: ["star", "spiral", "heart"],
+  heart: ["diamond", "spiral", "wave"],
+  star: ["crown", "bolt", "spiral"],
+  diamond: ["star", "heart", "bolt"],
   mountains: ["wave", "bolt", "star"],
-  spiral: ["flower", "heart", "wave"],
-  cat: ["heart", "flower", "spiral"],
+  spiral: ["heart", "wave", "diamond"],
+  crown: ["star", "mountains", "bolt"],
   bolt: ["star", "mountains", "wave"],
   wave: ["mountains", "spiral", "bolt"],
 };
@@ -356,12 +368,14 @@ function templatePath(description: string, forcedTemplate?: TemplateName) {
     }));
   }
 
-  if (selected === "flower") {
-    return normalize(Array.from({ length: 260 }, (_, index) => {
-      const angle = index / 259 * Math.PI * 2;
-      const radius = 0.42 + 0.32 * Math.sin(6 * angle);
-      return { x: Math.cos(angle) * radius, y: Math.sin(angle) * radius };
-    }));
+  if (selected === "diamond") {
+    return normalize([
+      { x: 0, y: -1 },
+      { x: 0.82, y: 0 },
+      { x: 0, y: 1 },
+      { x: -0.82, y: 0 },
+      { x: 0, y: -1 },
+    ]);
   }
 
   if (selected === "mountains") {
@@ -381,17 +395,16 @@ function templatePath(description: string, forcedTemplate?: TemplateName) {
     }));
   }
 
-  if (selected === "cat") {
-    const head = Array.from({ length: 180 }, (_, index) => {
-      const angle = index / 179 * Math.PI * 2;
-      return { x: Math.cos(angle) * 0.58, y: Math.sin(angle) * 0.48 + 0.12 };
-    });
+  if (selected === "crown") {
     return normalize([
-      ...head,
-      { x: -0.38, y: -0.28 }, { x: -0.5, y: -0.78 }, { x: -0.12, y: -0.42 },
-      { x: 0.12, y: -0.42 }, { x: 0.5, y: -0.78 }, { x: 0.38, y: -0.28 },
-      { x: 0.12, y: 0.08 }, { x: 0.18, y: 0.16 }, { x: 0.06, y: 0.18 },
-      { x: -0.06, y: 0.18 }, { x: -0.18, y: 0.16 }, { x: -0.12, y: 0.08 },
+      { x: -1, y: 0.5 },
+      { x: -0.82, y: -0.35 },
+      { x: -0.48, y: 0.05 },
+      { x: -0.18, y: -0.78 },
+      { x: 0.14, y: 0.05 },
+      { x: 0.48, y: -0.38 },
+      { x: 0.86, y: 0.5 },
+      { x: -1, y: 0.5 },
     ]);
   }
 
@@ -484,6 +497,10 @@ async function searchLocations(value: string, signal?: AbortSignal): Promise<Loc
 function shortLocationLabel(label: string) {
   const parts = label.split(",").map((part) => part.trim()).filter(Boolean);
   return parts.slice(0, 4).join(", ");
+}
+
+function coordinateLabel(point: LatLng) {
+  return `${point.lat.toFixed(5)}, ${point.lng.toFixed(5)}`;
 }
 
 function pathPreviewPoints(points: Point[]) {
@@ -1135,6 +1152,48 @@ function routeQualityPenalty(
   return { penalty, visits };
 }
 
+function chooseRouteCandidate<T extends { score: number }>(rankedRoutes: T[]) {
+  if (!rankedRoutes.length) {
+    return { candidate: null, poolSize: 0, selectedRank: 0 };
+  }
+
+  const bestScore = rankedRoutes[0].score;
+  const scoreWindow = Math.max(
+    matchConfig.routeChoiceMinScoreWindow,
+    Math.abs(bestScore) * matchConfig.routeChoiceScoreWindowRatio,
+  );
+  const nearBestPool = rankedRoutes
+    .filter((candidate) => candidate.score <= bestScore + scoreWindow)
+    .slice(0, matchConfig.routeChoicePoolSize);
+  const pool = nearBestPool.length > 1
+    ? nearBestPool
+    : rankedRoutes.slice(0, Math.min(matchConfig.routeChoicePoolSize, rankedRoutes.length));
+
+  if (pool.length <= 1) {
+    return { candidate: rankedRoutes[0], poolSize: pool.length, selectedRank: 1 };
+  }
+
+  const worstScore = pool.reduce((score, candidate) => Math.max(score, candidate.score), bestScore);
+  const spread = Math.max(1, worstScore - bestScore, scoreWindow);
+  const weights = pool.map((candidate, index) => {
+    const normalizedScoreGap = Math.max(0, candidate.score - bestScore) / spread;
+    return Math.exp(-normalizedScoreGap * matchConfig.routeChoiceScoreSharpness) / (1 + index * 0.18);
+  });
+  const totalWeight = weights.reduce((total, weight) => total + weight, 0);
+  let cursor = Math.random() * totalWeight;
+  const selectedIndex = weights.findIndex((weight) => {
+    cursor -= weight;
+    return cursor <= 0;
+  });
+  const candidate = pool[Math.max(0, selectedIndex)];
+
+  return {
+    candidate,
+    poolSize: pool.length,
+    selectedRank: rankedRoutes.indexOf(candidate) + 1,
+  };
+}
+
 function routeUsesOnlyGraphEdges(graph: RoadGraph, route: GraphNode[]) {
   return route.slice(1).every((node, index) => {
     const prev = route[index];
@@ -1501,11 +1560,12 @@ function roadMatchedRoute(graph: RoadGraph, variants: ShapeVariant[], center: La
         const prev = route[index];
         return sum + Math.max(0, Math.hypot(node.x - prev.x, node.y - prev.y) - 320);
       }, 0) / Math.max(route.length - 1, 1);
-      const duplicatePenalty = (snapped.length - new Set(route.map((node) => node.id)).size) * 80;
+      const duplicatePenalty = (snapped.length - new Set(route.map((node) => node.id)).size)
+        * matchConfig.duplicateWaypointPenalty;
       const startOffset = Math.hypot(route[0].x, route[0].y);
       const startPenalty = Math.max(0, startOffset - startRangeMeters) * matchConfig.outsideStartPenalty;
-      const score = snapPenalty
-        + jumpPenalty * 0.7
+      const score = snapPenalty * matchConfig.snapPenaltyWeight
+        + jumpPenalty * matchConfig.jumpPenaltyWeight
         + duplicatePenalty
         + startPenalty
         + candidate.startDrift * matchConfig.startDriftPenalty
@@ -1524,21 +1584,27 @@ function roadMatchedRoute(graph: RoadGraph, variants: ShapeVariant[], center: La
       if (!stitched) return null;
 
       const routeDistance = graphDistance(stitched.route);
-      const distancePenalty = Math.abs(routeDistance - targetDistanceMeters) * 0.08;
+      const severeShortfall = Math.max(0, targetDistanceMeters * matchConfig.minRouteDistanceRatio - routeDistance);
+      const distancePenalty = Math.abs(routeDistance - targetDistanceMeters) * matchConfig.distancePenaltyWeight
+        + severeShortfall * matchConfig.shortRoutePenaltyWeight;
       const detailPenalty = Math.max(0, stitched.route.length - 420) * 0.45;
       const skippedPenalty = stitched.skippedWaypoints * matchConfig.skippedWaypointPenalty;
       const startOffset = Math.hypot(stitched.route[0].x, stitched.route[0].y);
       const startPenalty = Math.max(0, startOffset - startRangeMeters) * matchConfig.outsideStartPenalty
         + startOffset * matchConfig.stitchedStartPenalty;
-      const qualityPenalty = routeQualityPenalty(graph, stitched.route).penalty * 0.35;
+      const qualityPenalty = routeQualityPenalty(graph, stitched.route).penalty * 0.18;
       const score = candidate.score + distancePenalty + detailPenalty + skippedPenalty + startPenalty + qualityPenalty;
 
-      return { score, route: stitched.route };
+      return { routeDistance, score, route: stitched.route };
     })
-    .filter((candidate): candidate is { score: number; route: GraphNode[] } => Boolean(candidate))
+    .filter((candidate): candidate is { routeDistance: number; score: number; route: GraphNode[] } => Boolean(candidate))
     .sort((a, b) => a.score - b.score);
 
-  const bestRoute = rankedRoutes[0]?.route ?? fallbackWalkableRoute(graph, center, kilometers);
+  const chosenCandidate = chooseRouteCandidate(rankedRoutes);
+  const bestCandidate = chosenCandidate.candidate;
+  const fallbackRoute = fallbackWalkableRoute(graph, center, kilometers);
+  const shouldUseFallback = Boolean(fallbackRoute && !bestCandidate);
+  const bestRoute = shouldUseFallback ? fallbackRoute : bestCandidate?.route ?? null;
   const startOffsetMeters = bestRoute ? Math.hypot(bestRoute[0].x, bestRoute[0].y) : 0;
   const routeLatLng = bestRoute
     ? densifyLatLngRoute(
@@ -1550,9 +1616,12 @@ function roadMatchedRoute(graph: RoadGraph, variants: ShapeVariant[], center: La
 
   const referencePoints = graph.segments.flatMap((segment) => [segment.a, segment.b]);
   return {
-    fallbackUsed: rankedRoutes.length === 0,
+    distanceFallbackUsed: false,
+    fallbackUsed: !bestCandidate && shouldUseFallback,
+    choicePoolSize: chosenCandidate.poolSize,
     points: withPreviewPoints(routeLatLng, center, referencePoints),
     rankedRoutes: rankedRoutes.length,
+    selectedRouteRank: chosenCandidate.selectedRank,
     startOffsetMeters,
   };
 }
@@ -1695,6 +1764,7 @@ function App() {
   const mapRef = useRef<L.Map | null>(null);
   const routeLayerRef = useRef<L.Polyline | null>(null);
   const roadLayerRef = useRef<L.LayerGroup | null>(null);
+  const centerMarkerRef = useRef<L.CircleMarker | null>(null);
   const startMarkerRef = useRef<L.CircleMarker | null>(null);
   const endMarkerRef = useRef<L.CircleMarker | null>(null);
   const matchRequestRef = useRef(0);
@@ -1746,6 +1816,7 @@ function App() {
     setMatchTiming(null);
     setGraphInfo(null);
     setMatchPhase("");
+    setIsMatchingRoads(false);
     setRoadStatus("Inputs changed. Press Match roads to calculate a walkable route.");
   }
 
@@ -1891,12 +1962,19 @@ function App() {
         routeMs,
         placements: matchTryCount,
         rankedRoutes: matchedResult.rankedRoutes,
+        selectedRouteRank: matchedResult.selectedRouteRank,
+        choicePoolSize: matchedResult.choicePoolSize,
         startOffsetMeters: matchedResult.startOffsetMeters,
       });
       const matchedStats = routeStats(matched);
-      const rankingStatus = matchedResult.fallbackUsed
-        ? "No connected candidate ranked; using a fallback walk."
-        : `Ranked ${matchedResult.rankedRoutes} connected candidates; chose the best route.`;
+      const choiceStatus = matchedResult.choicePoolSize > 1
+        ? `Picked option ${matchedResult.selectedRouteRank} from ${matchedResult.choicePoolSize} near-best routes.`
+        : "Chose the best route.";
+      const rankingStatus = matchedResult.distanceFallbackUsed
+        ? "Ranked candidates were too short; using a distance-preserving fallback."
+        : matchedResult.fallbackUsed
+          ? "No connected candidate ranked; using a fallback walk."
+          : `Ranked ${matchedResult.rankedRoutes} connected candidates. ${choiceStatus}`;
       const startStatus = matchedResult.startOffsetMeters > 30
         ? `Start moved ${Math.round(matchedResult.startOffsetMeters)} m from the selected location.`
         : "Start stays near the selected location.";
@@ -1943,6 +2021,22 @@ function App() {
     });
     mapRef.current = map;
 
+    map.on("click", (event) => {
+      const clicked = { lat: event.latlng.lat, lng: event.latlng.lng };
+      const label = coordinateLabel(clicked);
+      setLocation(label);
+      setSelectedLocation({
+        id: `map-${clicked.lat.toFixed(5)}-${clicked.lng.toFixed(5)}`,
+        label,
+        lat: clicked.lat,
+        lng: clicked.lng,
+        type: "map pin",
+      });
+      setLocationSuggestions([]);
+      setIsLocationFocused(false);
+      clearRoadMatch();
+    });
+
     void createBaseLayer().then((layer) => {
       setIsMapLoading(true);
       layer.on("loading", () => setIsMapLoading(true));
@@ -1985,6 +2079,20 @@ function App() {
       ).addTo(roadLayerRef.current!);
     });
 
+    const centerLatLng = L.latLng(center.lat, center.lng);
+    if (centerMarkerRef.current) {
+      centerMarkerRef.current.setLatLng(centerLatLng);
+    } else {
+      centerMarkerRef.current = L.circleMarker(centerLatLng, {
+        radius: 6,
+        color: "#ffffff",
+        weight: 2,
+        fillColor: "#0e7490",
+        fillOpacity: 1,
+        interactive: false,
+      }).addTo(map);
+    }
+
     if (routeLayerRef.current) {
       routeLayerRef.current.remove();
     }
@@ -2025,9 +2133,11 @@ function App() {
       }).addTo(map);
     }
 
-    const routeBounds = L.latLngBounds(routeLatLngs);
-    map.fitBounds(routeBounds.pad(0.18), { animate: true, maxZoom: 16 });
-  }, [route, roadSegments, hasWalkableRoute]);
+    if (!hasWalkableRoute) {
+      const routeBounds = L.latLngBounds(routeLatLngs);
+      map.fitBounds(routeBounds.pad(0.18), { animate: true, maxZoom: 16 });
+    }
+  }, [route, roadSegments, hasWalkableRoute, center.lat, center.lng]);
 
   useEffect(() => {
     const query = location.trim();
@@ -2076,7 +2186,7 @@ function App() {
                 resetDrawing();
                 clearRoadMatch();
               }}
-              placeholder="heart, star, flower, cat, mountains, spiral, bolt, wave..."
+              placeholder="heart, star, diamond, crown, mountains, spiral, bolt, wave..."
             />
           </label>
 
@@ -2207,7 +2317,7 @@ function App() {
             {isMatchingRoads
               ? "Calculating path..."
               : matchTiming
-                ? `Last calculation: ${formatMs(matchTiming.totalMs)} total / ${formatMs(matchTiming.roadSearchMs)} road data / ${formatMs(matchTiming.routeMs)} path${typeof matchTiming.rankedRoutes === "number" ? ` / ${matchTiming.rankedRoutes} ranked` : ""}${typeof matchTiming.startOffsetMeters === "number" ? ` / start ${Math.round(matchTiming.startOffsetMeters)} m from pin` : ""}`
+                ? `Last calculation: ${formatMs(matchTiming.totalMs)} total / ${formatMs(matchTiming.roadSearchMs)} road data / ${formatMs(matchTiming.routeMs)} path${typeof matchTiming.rankedRoutes === "number" ? ` / ${matchTiming.rankedRoutes} ranked` : ""}${typeof matchTiming.choicePoolSize === "number" && matchTiming.choicePoolSize > 1 ? ` / picked ${matchTiming.selectedRouteRank ?? 1}/${matchTiming.choicePoolSize}` : ""}${typeof matchTiming.startOffsetMeters === "number" ? ` / start ${Math.round(matchTiming.startOffsetMeters)} m from pin` : ""}`
                 : "Last calculation: not run yet"}
           </p>
           <p className="status timing">
