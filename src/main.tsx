@@ -41,8 +41,10 @@ type RoadGraph = {
   nodes: Map<string, GraphNode>;
   edges: Map<string, GraphEdge[]>;
   edgeKeys: Set<string>;
+  edgeGeometries: Map<string, RoutePoint[]>;
   nodeGrid: NodeGrid;
   segments: RoadSegment[];
+  rejectedSegments: number;
 };
 
 type LocationSuggestion = LatLng & {
@@ -62,9 +64,40 @@ type MatchTiming = {
   totalMs: number;
   roadSearchMs: number;
   routeMs: number;
+  placements?: number;
+  rankedRoutes?: number;
+};
+
+type GraphInfo = {
+  cacheVersion: string;
+  spacingMeters: number;
+  nodes: number;
+  edges: number;
+  rejectedSegments: number;
+};
+
+type SavedLocation = {
+  location: string;
+  selectedLocation: LocationSuggestion | null;
+};
+
+type ShapeVariant = {
+  name: string;
+  points: Point[];
+  penalty: number;
+};
+
+type ObstaclePolygon = {
+  points: Point[];
+  minX: number;
+  maxX: number;
+  minY: number;
+  maxY: number;
 };
 
 const locationPresets: Record<string, LatLng> = {
+  "litomerice": { lat: 50.5335, lng: 14.1318 },
+  "litoměřice": { lat: 50.5335, lng: 14.1318 },
   "prague": { lat: 50.0755, lng: 14.4378 },
   "praha": { lat: 50.0755, lng: 14.4378 },
   "london": { lat: 51.5072, lng: -0.1276 },
@@ -73,6 +106,14 @@ const locationPresets: Record<string, LatLng> = {
   "berlin": { lat: 52.52, lng: 13.405 },
   "paris": { lat: 48.8566, lng: 2.3522 },
   "tokyo": { lat: 35.6762, lng: 139.6503 },
+};
+
+const defaultLocation: LocationSuggestion = {
+  id: "preset-litomerice",
+  label: "Litoměřice, Czechia",
+  lat: 50.5335,
+  lng: 14.1318,
+  type: "city",
 };
 
 const templates = [
@@ -86,7 +127,59 @@ const templates = [
   "wave",
 ] as const;
 
+type TemplateName = typeof templates[number];
+
 const roadGraphCache = new Map<string, RoadGraph>();
+const savedLocationKey = "route-canvas.location";
+
+const matchConfig = {
+  graphCacheVersion: "variance-ranked-20m-v1",
+  roadNodeSpacingMeters: 20,
+  maxRenderedSegmentMeters: 10,
+  targetPoints: 40,
+  topCandidates: 56,
+  scales: [0.78, 0.86, 0.94, 1, 1.08, 1.16],
+  rotations: [
+    0,
+    Math.PI / 12,
+    -Math.PI / 12,
+    Math.PI / 6,
+    -Math.PI / 6,
+    Math.PI / 4,
+    -Math.PI / 4,
+    Math.PI / 2,
+    -Math.PI / 2,
+    Math.PI,
+  ],
+  pathBudgetFactor: 2.55,
+  pathBudgetPaddingMeters: 180,
+  minPathBudgetMeters: 200,
+  minSegmentBudgetMeters: 620,
+  segmentBudgetDivisor: 7.5,
+  heuristicWeight: 1.25,
+  shapeVariantLimit: 6,
+  shapeVariantPenalty: 520,
+  randomCandidatesPerVariant: 520,
+  randomScaleMin: 0.66,
+  randomScaleMax: 1.32,
+  waypointLookahead: 7,
+  stitchBeamWidth: 3,
+  futureFitLookahead: 3,
+  futureFitPenalty: 0.12,
+  maxSkippedWaypointRatio: 0.85,
+  skippedWaypointPenalty: 260,
+};
+
+const templateAlternates: Record<TemplateName, TemplateName[]> = {
+  heart: ["flower", "spiral", "wave"],
+  star: ["flower", "bolt", "spiral"],
+  flower: ["star", "spiral", "heart"],
+  mountains: ["wave", "bolt", "star"],
+  spiral: ["flower", "heart", "wave"],
+  cat: ["heart", "flower", "spiral"],
+  bolt: ["star", "mountains", "wave"],
+  wave: ["mountains", "spiral", "bolt"],
+};
 
 function distance(points: Point[]) {
   return points.slice(1).reduce((total, point, index) => {
@@ -124,6 +217,22 @@ function boundsOf(points: Point[]) {
   );
 }
 
+function pointInPolygon(point: Point, polygon: Point[]) {
+  let inside = false;
+
+  for (let index = 0, prevIndex = polygon.length - 1; index < polygon.length; prevIndex = index, index += 1) {
+    const current = polygon[index];
+    const prev = polygon[prevIndex];
+    const crosses = current.y > point.y !== prev.y > point.y;
+    if (!crosses) continue;
+
+    const xAtY = (prev.x - current.x) * (point.y - current.y) / (prev.y - current.y || 0.000001) + current.x;
+    if (point.x < xAtY) inside = !inside;
+  }
+
+  return inside;
+}
+
 function resample(points: Point[], count: number) {
   if (points.length < 2) return points;
 
@@ -157,9 +266,13 @@ function resample(points: Point[], count: number) {
   return sampled;
 }
 
-function templatePath(description: string) {
+function selectedTemplate(description: string): TemplateName {
   const text = description.toLowerCase();
-  const selected = templates.find((template) => text.includes(template)) ?? "heart";
+  return templates.find((template) => text.includes(template)) ?? "heart";
+}
+
+function templatePath(description: string, forcedTemplate?: TemplateName) {
+  const selected = forcedTemplate ?? selectedTemplate(description);
 
   if (selected === "star") {
     return normalize(Array.from({ length: 11 }, (_, index) => {
@@ -238,7 +351,7 @@ function parseLocation(value: string) {
     return { lat: Number(coords[1]), lng: Number(coords[2]) };
   }
 
-  return locationPresets[value.trim().toLowerCase()] ?? locationPresets.prague;
+  return locationPresets[value.trim().toLowerCase()] ?? locationPresets.litomerice;
 }
 
 async function resolveLocation(value: string) {
@@ -370,7 +483,7 @@ function withPreviewPoints(points: LatLng[], center: LatLng, referencePoints = p
 }
 
 function targetMeters(points: Point[], kilometers: number) {
-  const sampled = resample(points, 34);
+  const sampled = resample(points, matchConfig.targetPoints);
   const normalized = normalize(sampled);
   const scale = (kilometers * 1000) / Math.max(distance(normalized), 0.001);
 
@@ -390,13 +503,74 @@ function transformPoints(points: Point[], scale: number, rotation: number, offse
   }));
 }
 
+function startAnchors(startRangeMeters: number) {
+  const half = startRangeMeters * 0.5;
+  const diagonal = startRangeMeters * 0.7;
+
+  return [
+    { x: 0, y: 0 },
+    { x: half, y: 0 },
+    { x: -half, y: 0 },
+    { x: 0, y: half },
+    { x: 0, y: -half },
+    { x: startRangeMeters, y: 0 },
+    { x: -startRangeMeters, y: 0 },
+    { x: 0, y: startRangeMeters },
+    { x: 0, y: -startRangeMeters },
+    { x: diagonal, y: diagonal },
+    { x: -diagonal, y: diagonal },
+    { x: diagonal, y: -diagonal },
+    { x: -diagonal, y: -diagonal },
+  ];
+}
+
+function textShapeVariants(description: string): ShapeVariant[] {
+  const selected = selectedTemplate(description);
+  const ordered = [
+    selected,
+    ...templateAlternates[selected],
+    ...templates.filter((template) => template !== selected && !templateAlternates[selected].includes(template)),
+  ].slice(0, matchConfig.shapeVariantLimit);
+
+  return ordered.map((template, index) => ({
+    name: template,
+    points: templatePath(template, template),
+    penalty: index * matchConfig.shapeVariantPenalty,
+  }));
+}
+
+function uploadedShapeVariants(points: Point[]): ShapeVariant[] {
+  const normalized = normalize(points);
+  const reversed = [...normalized].reverse();
+  const simplified = normalize(resample(normalized, Math.min(48, Math.max(12, normalized.length))));
+
+  return [
+    { name: "uploaded", points: normalized, penalty: 0 },
+    { name: "uploaded reversed", points: reversed, penalty: matchConfig.shapeVariantPenalty * 0.5 },
+    { name: "uploaded simplified", points: simplified, penalty: matchConfig.shapeVariantPenalty * 0.75 },
+  ];
+}
+
+function shapeVariants(description: string, imagePath: Point[] | null): ShapeVariant[] {
+  return imagePath?.length ? uploadedShapeVariants(imagePath) : textShapeVariants(description);
+}
+
+function randomStartAnchor(startRangeMeters: number) {
+  const angle = Math.random() * Math.PI * 2;
+  const radius = Math.sqrt(Math.random()) * startRangeMeters;
+  return {
+    x: Math.cos(angle) * radius,
+    y: Math.sin(angle) * radius,
+  };
+}
+
 function gridKey(x: number, y: number, cellSize: number) {
   return `${Math.floor(x / cellSize)},${Math.floor(y / cellSize)}`;
 }
 
-function buildNodeGrid(nodes: Map<string, GraphNode>, cellSize = 180): NodeGrid {
+function buildNodeGrid(nodes: Map<string, GraphNode>, edges: Map<string, GraphEdge[]>, cellSize = 180): NodeGrid {
   const cells = new Map<string, GraphNode[]>();
-  const nodeList = Array.from(nodes.values());
+  const nodeList = Array.from(nodes.values()).filter((node) => (edges.get(node.id) ?? []).length > 0);
 
   nodeList.forEach((node) => {
     const key = gridKey(node.x, node.y, cellSize);
@@ -407,7 +581,13 @@ function buildNodeGrid(nodes: Map<string, GraphNode>, cellSize = 180): NodeGrid 
 }
 
 async function fetchRoadGraph(center: LatLng, radiusMeters: number): Promise<RoadGraph> {
-  const cacheKey = `${center.lat.toFixed(4)},${center.lng.toFixed(4)},${Math.round(radiusMeters / 100) * 100}`;
+  const cacheKey = [
+    matchConfig.graphCacheVersion,
+    `spacing-${matchConfig.roadNodeSpacingMeters}`,
+    center.lat.toFixed(4),
+    center.lng.toFixed(4),
+    Math.round(radiusMeters / 100) * 100,
+  ].join(":");
   const cached = roadGraphCache.get(cacheKey);
   if (cached) return cached;
 
@@ -462,8 +642,11 @@ async function fetchRoadGraph(center: LatLng, radiusMeters: number): Promise<Roa
   const graphNodes = new Map<string, GraphNode>();
   const edges = new Map<string, GraphEdge[]>();
   const edgeKeys = new Set<string>();
+  const edgeGeometries = new Map<string, RoutePoint[]>();
   const segments: RoadSegment[] = [];
   const osmNodes = new Map<number, LatLng>();
+  const obstacles: ObstaclePolygon[] = [];
+  let rejectedSegments = 0;
 
   data.elements.forEach((element) => {
     if (element.type === "node") {
@@ -471,8 +654,26 @@ async function fetchRoadGraph(center: LatLng, radiusMeters: number): Promise<Roa
     }
   });
 
-  function ensureNode(id: number, point: LatLng) {
-    const key = String(id);
+  data.elements.forEach((element) => {
+    if (element.type !== "way" || !element.tags?.building) return;
+    const points = (element.nodes ?? [])
+      .flatMap((nodeId) => {
+        const node = osmNodes.get(nodeId);
+        return node ? [toMeters(node, center)] : [];
+      });
+    if (points.length < 4) return;
+
+    const bounds = boundsOf(points);
+    obstacles.push({
+      points,
+      minX: bounds.minX - 1,
+      maxX: bounds.maxX + 1,
+      minY: bounds.minY - 1,
+      maxY: bounds.maxY + 1,
+    });
+  });
+
+  function ensureNode(key: string, point: LatLng) {
     if (!graphNodes.has(key)) {
       const local = toMeters(point, center);
       graphNodes.set(key, { id: key, ...point, ...local });
@@ -481,17 +682,69 @@ async function fetchRoadGraph(center: LatLng, radiusMeters: number): Promise<Roa
     return key;
   }
 
-  function addEdge(from: string, to: string, weight: number) {
+  function addEdge(from: string, to: string, weight: number, points: RoutePoint[]) {
     if (from === to) return;
     const edgeKey = `${from}->${to}`;
     if (edgeKeys.has(edgeKey)) return;
     const fromEdges = edges.get(from)!;
     fromEdges.push({ to, weight });
     edgeKeys.add(edgeKey);
+    edgeGeometries.set(edgeKey, points);
+  }
+
+  function addDenseSegment(fromId: number, toId: number, fromPoint: LatLng, toPoint: LatLng, name: string) {
+    const from = ensureNode(String(fromId), fromPoint);
+    const to = ensureNode(String(toId), toPoint);
+    const fromNode = graphNodes.get(from)!;
+    const toNode = graphNodes.get(to)!;
+    const totalWeight = Math.hypot(toNode.x - fromNode.x, toNode.y - fromNode.y);
+    const steps = Math.max(1, Math.ceil(totalWeight / matchConfig.roadNodeSpacingMeters));
+    let prevKey = from;
+    let prevNode = fromNode;
+
+    for (let step = 1; step <= steps; step += 1) {
+      const progress = step / steps;
+      const key = step === steps ? to : `v:${fromId}:${toId}:${step}`;
+      const densePoint = {
+        lat: fromPoint.lat + (toPoint.lat - fromPoint.lat) * progress,
+        lng: fromPoint.lng + (toPoint.lng - fromPoint.lng) * progress,
+      };
+      const denseLocal = toMeters(densePoint, center);
+      const crossesObstacle = obstacles.some((polygon) =>
+        denseLocal.x >= polygon.minX
+        && denseLocal.x <= polygon.maxX
+        && denseLocal.y >= polygon.minY
+        && denseLocal.y <= polygon.maxY
+        && pointInPolygon(denseLocal, polygon.points)
+      );
+
+      if (crossesObstacle) {
+        rejectedSegments += 1;
+        prevKey = "";
+        continue;
+      }
+
+      ensureNode(key, densePoint);
+
+      const currentNode = graphNodes.get(key)!;
+      const weight = Math.hypot(currentNode.x - prevNode.x, currentNode.y - prevNode.y);
+      if (prevKey) {
+        addEdge(prevKey, key, weight, [{ ...prevNode }, { ...currentNode }]);
+        addEdge(key, prevKey, weight, [{ ...currentNode }, { ...prevNode }]);
+        segments.push({
+          a: { ...prevNode },
+          b: { ...currentNode },
+          name,
+        });
+      }
+
+      prevKey = key;
+      prevNode = currentNode;
+    }
   }
 
   data.elements.forEach((element) => {
-    if (element.type !== "way") return;
+    if (element.type !== "way" || !element.tags?.highway) return;
     const name = element.tags?.name ?? element.tags?.highway ?? "road";
     const nodeIds = element.nodes ?? [];
 
@@ -501,26 +754,15 @@ async function fetchRoadGraph(center: LatLng, radiusMeters: number): Promise<Roa
       const current = osmNodes.get(nodeId);
       if (!prev || !current) return;
 
-      const from = ensureNode(prevNodeId, prev);
-      const to = ensureNode(nodeId, current);
-      const fromNode = graphNodes.get(from)!;
-      const toNode = graphNodes.get(to)!;
-      const weight = Math.hypot(toNode.x - fromNode.x, toNode.y - fromNode.y);
-      addEdge(from, to, weight);
-      addEdge(to, from, weight);
-      segments.push({
-        a: { ...fromNode },
-        b: { ...toNode },
-        name,
-      });
+      addDenseSegment(prevNodeId, nodeId, prev, current, name);
     });
   });
 
-  if (segments.length < 20) {
+  if (segments.length < 2) {
     throw new Error("Not enough walkable streets found nearby. Try a larger distance or a denser location.");
   }
 
-  const graph = { nodes: graphNodes, edges, edgeKeys, nodeGrid: buildNodeGrid(graphNodes), segments };
+  const graph = { nodes: graphNodes, edges, edgeKeys, edgeGeometries, nodeGrid: buildNodeGrid(graphNodes, edges), segments, rejectedSegments };
   roadGraphCache.set(cacheKey, graph);
   return graph;
 }
@@ -578,6 +820,43 @@ function routeUsesOnlyGraphEdges(graph: RoadGraph, route: GraphNode[]) {
   });
 }
 
+function expandRouteGeometry(graph: RoadGraph, route: GraphNode[]) {
+  const expanded: RoutePoint[] = [];
+
+  route.slice(1).forEach((node, index) => {
+    const prev = route[index];
+    const geometry = graph.edgeGeometries.get(`${prev.id}->${node.id}`);
+    if (!geometry?.length) return;
+    expanded.push(...(expanded.length ? geometry.slice(1) : geometry));
+  });
+
+  return expanded;
+}
+
+function densifyLatLngRoute(points: LatLng[], center: LatLng, maxSegmentMeters: number) {
+  if (points.length < 2) return points;
+
+  const dense: LatLng[] = [points[0]];
+
+  points.slice(1).forEach((point, index) => {
+    const prev = points[index];
+    const prevLocal = toMeters(prev, center);
+    const currentLocal = toMeters(point, center);
+    const length = Math.hypot(currentLocal.x - prevLocal.x, currentLocal.y - prevLocal.y);
+    const steps = Math.max(1, Math.ceil(length / maxSegmentMeters));
+
+    for (let step = 1; step <= steps; step += 1) {
+      const progress = step / steps;
+      dense.push(fromMeters({
+        x: prevLocal.x + (currentLocal.x - prevLocal.x) * progress,
+        y: prevLocal.y + (currentLocal.y - prevLocal.y) * progress,
+      }, center));
+    }
+  });
+
+  return dense;
+}
+
 function pushHeap<T>(heap: T[], item: T, priority: (item: T) => number) {
   heap.push(item);
   let index = heap.length - 1;
@@ -619,7 +898,10 @@ function shortestWalkablePath(graph: RoadGraph, start: GraphNode, end: GraphNode
   if (start.id === end.id) return [start];
 
   const directDistance = Math.hypot(end.x - start.x, end.y - start.y);
-  const budget = Math.max(maxMeters, directDistance * 4, 260);
+  const budget = Math.max(
+    matchConfig.minPathBudgetMeters,
+    Math.min(maxMeters, directDistance * matchConfig.pathBudgetFactor + matchConfig.pathBudgetPaddingMeters),
+  );
   const distances = new Map<string, number>([[start.id, 0]]);
   const previous = new Map<string, string>();
   const open: Array<{ id: string; priority: number }> = [{ id: start.id, priority: directDistance }];
@@ -658,7 +940,11 @@ function shortestWalkablePath(graph: RoadGraph, start: GraphNode, end: GraphNode
 
       distances.set(edge.to, nextDistance);
       previous.set(edge.to, current.id);
-      pushHeap(open, { id: edge.to, priority: nextDistance + heuristic }, (item) => item.priority);
+      pushHeap(
+        open,
+        { id: edge.to, priority: nextDistance + heuristic * matchConfig.heuristicWeight },
+        (item) => item.priority,
+      );
     });
   }
 
@@ -668,60 +954,201 @@ function shortestWalkablePath(graph: RoadGraph, start: GraphNode, end: GraphNode
 function stitchWalkableRoute(graph: RoadGraph, waypoints: GraphNode[], segmentBudgetMeters: number) {
   if (waypoints.length < 2) return null;
 
-  const route: GraphNode[] = [waypoints[0]];
+  type StitchState = {
+    connectedLegs: number;
+    index: number;
+    route: GraphNode[];
+    score: number;
+    skippedWaypoints: number;
+  };
 
-  for (let index = 1; index < waypoints.length; index += 1) {
-    const from = route[route.length - 1];
-    const to = waypoints[index];
-    const path = shortestWalkablePath(graph, from, to, segmentBudgetMeters);
+  function futureFitPenalty(node: GraphNode, startIndex: number) {
+    const futureTargets = waypoints.slice(
+      startIndex,
+      Math.min(waypoints.length, startIndex + matchConfig.futureFitLookahead),
+    );
+    if (!futureTargets.length) return 0;
 
-    if (!path || path.length < 2) {
-      return null;
-    }
+    return futureTargets.reduce((sum, target, offset) => {
+      const distance = Math.hypot(node.x - target.x, node.y - target.y);
+      return sum + distance * matchConfig.futureFitPenalty / (offset + 1);
+    }, 0);
+  }
 
-    route.push(...path.slice(1));
+  let beam: StitchState[] = [{
+    connectedLegs: 0,
+    index: 1,
+    route: [waypoints[0]],
+    score: 0,
+    skippedWaypoints: 0,
+  }];
+  const completed: StitchState[] = [];
+  const maxSkippedWaypoints = Math.floor(waypoints.length * matchConfig.maxSkippedWaypointRatio);
+
+  for (let iteration = 0; iteration < waypoints.length && beam.length; iteration += 1) {
+    const nextBeam: StitchState[] = [];
+
+    beam.forEach((state) => {
+      if (state.index >= waypoints.length) {
+        completed.push(state);
+        return;
+      }
+
+      if (state.skippedWaypoints < maxSkippedWaypoints) {
+        nextBeam.push({
+          ...state,
+          index: state.index + 1,
+          score: state.score + matchConfig.skippedWaypointPenalty * 1.15,
+          skippedWaypoints: state.skippedWaypoints + 1,
+        });
+      }
+
+      const from = state.route[state.route.length - 1];
+      const lastLookaheadIndex = Math.min(waypoints.length - 1, state.index + matchConfig.waypointLookahead);
+
+      for (let targetIndex = state.index; targetIndex <= lastLookaheadIndex; targetIndex += 1) {
+        const skipped = targetIndex - state.index;
+        if (state.skippedWaypoints + skipped > maxSkippedWaypoints) continue;
+
+        const path = shortestWalkablePath(
+          graph,
+          from,
+          waypoints[targetIndex],
+          segmentBudgetMeters * (1 + skipped * 0.45),
+        );
+        if (!path || path.length < 2) continue;
+
+        const end = path[path.length - 1];
+        const route = [...state.route, ...path.slice(1)];
+        const distancePenalty = graphDistance(path) * 0.018;
+        const skippedPenalty = skipped * matchConfig.skippedWaypointPenalty;
+        const fitPenalty = futureFitPenalty(end, targetIndex + 1);
+
+        nextBeam.push({
+          connectedLegs: state.connectedLegs + 1,
+          index: targetIndex + 1,
+          route,
+          score: state.score + distancePenalty + skippedPenalty + fitPenalty,
+          skippedWaypoints: state.skippedWaypoints + skipped,
+        });
+      }
+    });
+
+    beam = nextBeam
+      .sort((a, b) => a.score - b.score)
+      .slice(0, matchConfig.stitchBeamWidth);
+  }
+
+  completed.push(...beam.filter((state) => state.index >= waypoints.length || state.connectedLegs > 0));
+
+  const best = completed
+    .filter((state) => state.connectedLegs > 0)
+    .sort((a, b) => a.score - b.score)[0];
+  if (!best) return null;
+
+  const deduped = best.route.filter((node, index, array) => node.id !== array[index - 1]?.id);
+  if (deduped.length < 4) return null;
+  if (!routeUsesOnlyGraphEdges(graph, deduped)) return null;
+
+  const minConnectedLegs = Math.max(1, Math.floor((waypoints.length - 1) * (1 - matchConfig.maxSkippedWaypointRatio)));
+  if (best.skippedWaypoints > maxSkippedWaypoints || best.connectedLegs < minConnectedLegs) return null;
+
+  return { route: deduped, skippedWaypoints: best.skippedWaypoints, connectedLegs: best.connectedLegs };
+}
+
+function fallbackWalkableRoute(graph: RoadGraph, center: LatLng, kilometers: number) {
+  const start = nearestNode(graph, { x: 0, y: 0 }).node ?? graph.nodeGrid.nodes[0];
+  if (!start) return null;
+
+  const targetMeters = kilometers * 1000;
+  const route: GraphNode[] = [start];
+  const edgeVisits = new Map<string, number>();
+  let current = start;
+  let previousId = "";
+  let meters = 0;
+
+  for (let step = 0; step < 6000 && (meters < targetMeters || route.length < 8); step += 1) {
+    const edges = (graph.edges.get(current.id) ?? [])
+      .flatMap((edge) => {
+        const next = graph.nodes.get(edge.to);
+        return next ? [{ edge, next }] : [];
+      });
+    if (!edges.length) break;
+
+    const progress = meters / Math.max(targetMeters, 1);
+    const preferredHeading = progress * Math.PI * 2 + Math.PI / 3;
+    const best = edges
+      .map(({ edge, next }) => {
+        const edgeKey = `${current.id}->${next.id}`;
+        const heading = Math.atan2(next.y - current.y, next.x - current.x);
+        const headingPenalty = Math.abs(Math.atan2(Math.sin(heading - preferredHeading), Math.cos(heading - preferredHeading)));
+        const backtrackPenalty = next.id === previousId ? 1.5 : 0;
+        const usedPenalty = (edgeVisits.get(edgeKey) ?? 0) * 2.5;
+        const overshootPenalty = Math.max(0, meters + edge.weight - targetMeters * 1.15) / 80;
+        return { edge, next, score: headingPenalty + backtrackPenalty + usedPenalty + overshootPenalty };
+      })
+      .sort((a, b) => a.score - b.score)[0];
+
+    if (!best) break;
+
+    const edgeKey = `${current.id}->${best.next.id}`;
+    edgeVisits.set(edgeKey, (edgeVisits.get(edgeKey) ?? 0) + 1);
+    previousId = current.id;
+    current = best.next;
+    meters += best.edge.weight;
+    route.push(current);
   }
 
   const deduped = route.filter((node, index, array) => node.id !== array[index - 1]?.id);
-  if (deduped.length < 4) return null;
-  return routeUsesOnlyGraphEdges(graph, deduped) ? deduped : null;
+  if (deduped.length < 4 || !routeUsesOnlyGraphEdges(graph, deduped)) return null;
+  return deduped;
 }
 
-function roadMatchedRoute(graph: RoadGraph, artPoints: Point[], center: LatLng, kilometers: number) {
-  const baseTargets = targetMeters(artPoints, kilometers);
+function roadMatchedRoute(graph: RoadGraph, variants: ShapeVariant[], center: LatLng, kilometers: number) {
   const startRangeMeters = kilometers * 1000 * 0.05;
   const targetDistanceMeters = kilometers * 1000;
-  const segmentBudgetMeters = Math.max(520, targetDistanceMeters / 8);
-  const scales = [0.82, 0.94, 1, 1.08];
-  const rotations = [0, Math.PI / 10, -Math.PI / 10, Math.PI / 5, -Math.PI / 5, Math.PI / 2, -Math.PI / 2];
-  const startAnchors = [
-    { x: 0, y: 0 },
-    { x: startRangeMeters, y: 0 },
-    { x: -startRangeMeters, y: 0 },
-    { x: 0, y: startRangeMeters },
-    { x: 0, y: -startRangeMeters },
-    { x: startRangeMeters * 0.7, y: startRangeMeters * 0.7 },
-    { x: -startRangeMeters * 0.7, y: startRangeMeters * 0.7 },
-    { x: startRangeMeters * 0.7, y: -startRangeMeters * 0.7 },
-    { x: -startRangeMeters * 0.7, y: -startRangeMeters * 0.7 },
-  ];
-  const rawCandidates: Array<{ targets: Point[]; startDrift: number }> = [];
+  const segmentBudgetMeters = Math.max(matchConfig.minSegmentBudgetMeters, targetDistanceMeters / matchConfig.segmentBudgetDivisor);
+  const scales = matchConfig.scales;
+  const rotations = matchConfig.rotations;
+  const anchors = startAnchors(startRangeMeters);
+  const rawCandidates: Array<{ targets: Point[]; startDrift: number; shapePenalty: number }> = [];
 
-  for (const scale of scales) {
-    for (const rotation of rotations) {
-      const rotatedStart = transformPoints([baseTargets[0]], scale, rotation, { x: 0, y: 0 })[0];
+  variants.forEach((variant) => {
+    const baseTargets = targetMeters(variant.points, kilometers);
 
-      for (const startAnchor of startAnchors) {
-        rawCandidates.push({
-          startDrift: Math.hypot(startAnchor.x, startAnchor.y),
-          targets: transformPoints(baseTargets, scale, rotation, {
-            x: startAnchor.x - rotatedStart.x,
-            y: startAnchor.y - rotatedStart.y,
-          }),
-        });
+    for (const scale of scales) {
+      for (const rotation of rotations) {
+        const rotatedStart = transformPoints([baseTargets[0]], scale, rotation, { x: 0, y: 0 })[0];
+
+        for (const startAnchor of anchors) {
+          rawCandidates.push({
+            startDrift: Math.hypot(startAnchor.x, startAnchor.y),
+            shapePenalty: variant.penalty,
+            targets: transformPoints(baseTargets, scale, rotation, {
+              x: startAnchor.x - rotatedStart.x,
+              y: startAnchor.y - rotatedStart.y,
+            }),
+          });
+        }
       }
     }
-  }
+
+    for (let index = 0; index < matchConfig.randomCandidatesPerVariant; index += 1) {
+      const scale = matchConfig.randomScaleMin + Math.random() * (matchConfig.randomScaleMax - matchConfig.randomScaleMin);
+      const rotation = Math.random() * Math.PI * 2;
+      const startAnchor = randomStartAnchor(startRangeMeters);
+      const rotatedStart = transformPoints([baseTargets[0]], scale, rotation, { x: 0, y: 0 })[0];
+
+      rawCandidates.push({
+        startDrift: Math.hypot(startAnchor.x, startAnchor.y),
+        shapePenalty: variant.penalty + 120,
+        targets: transformPoints(baseTargets, scale, rotation, {
+          x: startAnchor.x - rotatedStart.x,
+          y: startAnchor.y - rotatedStart.y,
+        }),
+      });
+    }
+  });
 
   const rawRanked = rawCandidates
     .map((candidate) => {
@@ -738,35 +1165,45 @@ function roadMatchedRoute(graph: RoadGraph, artPoints: Point[], center: LatLng, 
       }, 0) / Math.max(route.length - 1, 1);
       const duplicatePenalty = (snapped.length - new Set(route.map((node) => node.id)).size) * 80;
       const startPenalty = Math.max(0, Math.hypot(route[0].x, route[0].y) - startRangeMeters) * 2;
-      const score = snapPenalty + jumpPenalty * 0.7 + duplicatePenalty + startPenalty + candidate.startDrift * 0.2;
+      const score = snapPenalty + jumpPenalty * 0.7 + duplicatePenalty + startPenalty + candidate.startDrift * 0.2 + candidate.shapePenalty;
 
       return { score, route };
     })
     .filter((candidate): candidate is { score: number; route: GraphNode[] } => Boolean(candidate))
     .sort((a, b) => a.score - b.score)
-    .slice(0, 6);
+    .slice(0, matchConfig.topCandidates);
 
-  const best = rawRanked
+  const rankedRoutes = rawRanked
     .map((candidate) => {
-      const route = stitchWalkableRoute(graph, candidate.route, segmentBudgetMeters);
-      if (!route) return null;
+      const stitched = stitchWalkableRoute(graph, candidate.route, segmentBudgetMeters);
+      if (!stitched) return null;
 
-      const routeDistance = graphDistance(route);
+      const routeDistance = graphDistance(stitched.route);
       const distancePenalty = Math.abs(routeDistance - targetDistanceMeters) * 0.08;
-      const detailPenalty = Math.max(0, route.length - 420) * 0.45;
-      const score = candidate.score + distancePenalty + detailPenalty;
+      const detailPenalty = Math.max(0, stitched.route.length - 420) * 0.45;
+      const skippedPenalty = stitched.skippedWaypoints * matchConfig.skippedWaypointPenalty;
+      const score = candidate.score + distancePenalty + detailPenalty + skippedPenalty;
 
-      return { score, route };
+      return { score, route: stitched.route };
     })
     .filter((candidate): candidate is { score: number; route: GraphNode[] } => Boolean(candidate))
-    .sort((a, b) => a.score - b.score)[0] ?? null;
+    .sort((a, b) => a.score - b.score);
 
-  const routeLatLng = best
-    ? best.route.map((node: GraphNode) => ({ lat: node.lat, lng: node.lng }))
+  const bestRoute = rankedRoutes[0]?.route ?? fallbackWalkableRoute(graph, center, kilometers);
+  const routeLatLng = bestRoute
+    ? densifyLatLngRoute(
+      expandRouteGeometry(graph, bestRoute).map((point) => ({ lat: point.lat, lng: point.lng })),
+      center,
+      matchConfig.maxRenderedSegmentMeters,
+    )
     : [];
 
   const referencePoints = graph.segments.flatMap((segment) => [segment.a, segment.b]);
-  return withPreviewPoints(routeLatLng, center, referencePoints);
+  return {
+    fallbackUsed: rankedRoutes.length === 0,
+    points: withPreviewPoints(routeLatLng, center, referencePoints),
+    rankedRoutes: rankedRoutes.length,
+  };
 }
 
 function gpx(points: RoutePoint[], name: string) {
@@ -788,6 +1225,33 @@ ${trkpts}
 
 function formatMs(ms: number) {
   return ms >= 1000 ? `${(ms / 1000).toFixed(2)} s` : `${Math.round(ms)} ms`;
+}
+
+function loadSavedLocation(): SavedLocation {
+  if (typeof window === "undefined") {
+    return { location: "Litoměřice", selectedLocation: defaultLocation };
+  }
+
+  try {
+    const saved = window.localStorage.getItem(savedLocationKey);
+    if (!saved) return { location: "Litoměřice", selectedLocation: defaultLocation };
+
+    const parsed = JSON.parse(saved) as Partial<SavedLocation>;
+    return {
+      location: typeof parsed.location === "string" && parsed.location.trim() ? parsed.location : "Litoměřice",
+      selectedLocation: parsed.selectedLocation && typeof parsed.selectedLocation.lat === "number" && typeof parsed.selectedLocation.lng === "number"
+        ? parsed.selectedLocation
+        : null,
+    };
+  } catch {
+    return { location: "Litoměřice", selectedLocation: defaultLocation };
+  }
+}
+
+function waitForPaint() {
+  return new Promise<void>((resolve) => {
+    window.requestAnimationFrame(() => resolve());
+  });
 }
 
 async function imageToPath(file: File): Promise<Point[]> {
@@ -874,15 +1338,10 @@ async function createBaseLayer() {
 }
 
 function App() {
+  const savedLocation = useMemo(loadSavedLocation, []);
   const [description, setDescription] = useState("star");
-  const [location, setLocation] = useState("Prague");
-  const [selectedLocation, setSelectedLocation] = useState<LocationSuggestion | null>({
-    id: "preset-prague",
-    label: "Prague, Czechia",
-    lat: 50.0755,
-    lng: 14.4378,
-    type: "city",
-  });
+  const [location, setLocation] = useState(savedLocation.location);
+  const [selectedLocation, setSelectedLocation] = useState<LocationSuggestion | null>(savedLocation.selectedLocation);
   const [locationSuggestions, setLocationSuggestions] = useState<LocationSuggestion[]>([]);
   const [isSearchingLocations, setIsSearchingLocations] = useState(false);
   const [isLocationFocused, setIsLocationFocused] = useState(false);
@@ -895,7 +1354,10 @@ function App() {
   const [roadCenter, setRoadCenter] = useState<LatLng | null>(null);
   const [roadStatus, setRoadStatus] = useState("Use Match roads to build the GPX from real walkable streets.");
   const [isMatchingRoads, setIsMatchingRoads] = useState(false);
+  const [matchPhase, setMatchPhase] = useState("");
+  const [isMapLoading, setIsMapLoading] = useState(true);
   const [matchTiming, setMatchTiming] = useState<MatchTiming | null>(null);
+  const [graphInfo, setGraphInfo] = useState<GraphInfo | null>(null);
   const [hasLoadedOnce, setHasLoadedOnce] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
   const mapElementRef = useRef<HTMLDivElement>(null);
@@ -906,10 +1368,11 @@ function App() {
   const endMarkerRef = useRef<L.CircleMarker | null>(null);
   const matchRequestRef = useRef(0);
 
-  const sourcePoints = useMemo(
-    () => imagePath?.length ? imagePath : templatePath(description),
+  const sourceVariants = useMemo(
+    () => shapeVariants(description, imagePath),
     [description, imagePath],
   );
+  const sourcePoints = sourceVariants[0].points;
   const templatePreviews = useMemo(
     () => templates.map((template) => ({
       name: template,
@@ -924,6 +1387,12 @@ function App() {
   }, [sourcePoints, center.lat, center.lng, distanceKm]);
   const hasWalkableRoute = Boolean(roadRoute?.length);
   const route = roadRoute?.length ? roadRoute : sketchRoute;
+  const matchTryCount = sourceVariants.length * (
+    matchConfig.scales.length
+    * matchConfig.rotations.length
+    * startAnchors(distanceKm * 1000 * 0.05).length
+    + matchConfig.randomCandidatesPerVariant
+  );
   const stats = routeStats(route);
   const bounds = {
     north: Math.max(...route.map((point) => point.lat)),
@@ -931,6 +1400,13 @@ function App() {
     east: Math.max(...route.map((point) => point.lng)),
     west: Math.min(...route.map((point) => point.lng)),
   };
+  const mapOverlayText = isTracing
+    ? "Tracing image..."
+    : isMatchingRoads
+      ? matchPhase || "Calculating walkable route..."
+      : isMapLoading
+        ? "Loading map tiles..."
+        : "";
 
   function clearRoadMatch() {
     matchRequestRef.current += 1;
@@ -938,6 +1414,8 @@ function App() {
     setRoadSegments([]);
     setRoadCenter(null);
     setMatchTiming(null);
+    setGraphInfo(null);
+    setMatchPhase("Waiting for inputs to settle...");
     setRoadStatus("Recalculating route from current inputs...");
   }
 
@@ -958,25 +1436,40 @@ function App() {
     const startedAt = performance.now();
     let roadSearchMs = 0;
     let routeMs = 0;
+    let hasLoadedGraph = false;
     setIsMatchingRoads(true);
     setMatchTiming(null);
+    setMatchPhase("Resolving start point...");
     setRoadStatus("Searching OpenStreetMap for nearby walkable streets...");
 
     try {
       const resolvedCenter = selectedLocation ?? await resolveLocation(location);
       const radius = Math.min(Math.max(distanceKm * 430, 850), 4200);
+      setMatchPhase("Loading walkable streets and obstacles...");
       const roadSearchStartedAt = performance.now();
       const graph = await fetchRoadGraph(resolvedCenter, radius);
       roadSearchMs = performance.now() - roadSearchStartedAt;
+      hasLoadedGraph = true;
+      setGraphInfo({
+        cacheVersion: matchConfig.graphCacheVersion,
+        spacingMeters: matchConfig.roadNodeSpacingMeters,
+        nodes: graph.nodes.size,
+        edges: graph.edgeKeys.size,
+        rejectedSegments: graph.rejectedSegments,
+      });
       if (requestId !== matchRequestRef.current) return;
 
+      setMatchPhase(`Testing ${matchTryCount} shape placements...`);
+      setRoadStatus(`Testing ${matchTryCount} placements and stitching the best ${matchConfig.topCandidates} to roads...`);
+      await waitForPaint();
       const routeStartedAt = performance.now();
-      const matched = roadMatchedRoute(graph, sourcePoints, resolvedCenter, distanceKm);
+      const matchedResult = roadMatchedRoute(graph, sourceVariants, resolvedCenter, distanceKm);
+      const matched = matchedResult.points;
       routeMs = performance.now() - routeStartedAt;
       if (requestId !== matchRequestRef.current) return;
 
       if (matched.length < 2) {
-        throw new Error("Could not build a fully walkable road-connected version of this shape here.");
+        throw new Error("Road data loaded, but no connected graph route could be produced.");
       }
 
       setRoadRoute(matched);
@@ -987,28 +1480,37 @@ function App() {
         totalMs: performance.now() - startedAt,
         roadSearchMs,
         routeMs,
+        placements: matchTryCount,
+        rankedRoutes: matchedResult.rankedRoutes,
       });
       const matchedStats = routeStats(matched);
-      setRoadStatus(`Matched ${matched.length} route points on real streets. GPX distance is ${matchedStats.kilometers.toFixed(2)} km.`);
+      const rankingStatus = matchedResult.fallbackUsed
+        ? "No connected candidate ranked; using a fallback walk."
+        : `Ranked ${matchedResult.rankedRoutes} connected candidates; chose the best route.`;
+      setMatchPhase("");
+      setRoadStatus(`${rankingStatus} GPX distance is ${matchedStats.kilometers.toFixed(2)} km.`);
     } catch (error) {
       if (requestId !== matchRequestRef.current) return;
       setRoadRoute(null);
       setRoadSegments([]);
       setRoadCenter(null);
+      if (!hasLoadedGraph) setGraphInfo(null);
       setMatchTiming({
         totalMs: performance.now() - startedAt,
         roadSearchMs,
         routeMs,
       });
       setHasLoadedOnce(true);
+      setMatchPhase("");
       setRoadStatus(
         hasLoadedOnce
           ? error instanceof Error ? error.message : "Road matching failed."
-          : "Showing the generated sketch now. Road data is slow, so use Match roads to retry in the background.",
+          : error instanceof Error ? error.message : "Showing the generated sketch now. Road data is slow, so use Match roads to retry.",
       );
     } finally {
       if (requestId === matchRequestRef.current) {
         setIsMatchingRoads(false);
+        setMatchPhase("");
       }
     }
   }
@@ -1024,6 +1526,10 @@ function App() {
   }, [sourcePoints, location, selectedLocation?.lat, selectedLocation?.lng, distanceKm, isTracing]);
 
   useEffect(() => {
+    window.localStorage.setItem(savedLocationKey, JSON.stringify({ location, selectedLocation }));
+  }, [location, selectedLocation]);
+
+  useEffect(() => {
     if (!mapElementRef.current || mapRef.current) return undefined;
 
     const map = L.map(mapElementRef.current, {
@@ -1035,6 +1541,10 @@ function App() {
     mapRef.current = map;
 
     void createBaseLayer().then((layer) => {
+      setIsMapLoading(true);
+      layer.on("loading", () => setIsMapLoading(true));
+      layer.on("load", () => setIsMapLoading(false));
+      layer.on("tileerror", () => setIsMapLoading(false));
       layer.addTo(map);
     });
 
@@ -1066,23 +1576,25 @@ function App() {
           weight: 1.6,
           opacity: 0.35,
           smoothFactor: 0,
+          noClip: true,
           interactive: false,
         },
       ).addTo(roadLayerRef.current!);
     });
 
     if (routeLayerRef.current) {
-      routeLayerRef.current.setLatLngs(routeLatLngs);
-    } else {
-      routeLayerRef.current = L.polyline(routeLatLngs, {
-        color: "#fc4c02",
-        weight: 6,
-        opacity: 0.92,
-        lineCap: "round",
-        lineJoin: "round",
-        smoothFactor: 0,
-      }).addTo(map);
+      routeLayerRef.current.remove();
     }
+    routeLayerRef.current = L.polyline(routeLatLngs, {
+      color: hasWalkableRoute ? "#fc4c02" : "#556070",
+      weight: hasWalkableRoute ? 6 : 3,
+      opacity: hasWalkableRoute ? 0.92 : 0.56,
+      lineCap: "round",
+      lineJoin: "round",
+      dashArray: hasWalkableRoute ? undefined : "8 8",
+      smoothFactor: 0,
+      noClip: true,
+    }).addTo(map);
 
     const start = routeLatLngs[0];
     const end = routeLatLngs[routeLatLngs.length - 1];
@@ -1112,7 +1624,7 @@ function App() {
 
     const routeBounds = L.latLngBounds(routeLatLngs);
     map.fitBounds(routeBounds.pad(0.18), { animate: true, maxZoom: 16 });
-  }, [route, roadSegments]);
+  }, [route, roadSegments, hasWalkableRoute]);
 
   useEffect(() => {
     const query = location.trim();
@@ -1148,8 +1660,8 @@ function App() {
       <section className="workspace">
         <aside className="panel">
           <div>
-            <p className="eyebrow">Walking route generator</p>
-            <h1>Strava Art Walker</h1>
+            <p className="eyebrow">Walking art planner</p>
+            <h1>Route Canvas</h1>
           </div>
 
           <label>
@@ -1280,13 +1792,24 @@ function App() {
             {isMatchingRoads
               ? "Calculating path..."
               : matchTiming
-                ? `Last calculation: ${formatMs(matchTiming.totalMs)} total / ${formatMs(matchTiming.roadSearchMs)} road data / ${formatMs(matchTiming.routeMs)} path`
+                ? `Last calculation: ${formatMs(matchTiming.totalMs)} total / ${formatMs(matchTiming.roadSearchMs)} road data / ${formatMs(matchTiming.routeMs)} path${typeof matchTiming.rankedRoutes === "number" ? ` / ${matchTiming.rankedRoutes} ranked` : ""}`
                 : "Last calculation: not run yet"}
+          </p>
+          <p className="status timing">
+            {graphInfo
+              ? `Graph ${graphInfo.cacheVersion} / ${graphInfo.spacingMeters}m nodes / ${graphInfo.nodes} nodes / ${graphInfo.edges} edges / ${graphInfo.rejectedSegments} blocked`
+              : `Graph ${matchConfig.graphCacheVersion} / ${matchConfig.roadNodeSpacingMeters}m nodes / not loaded`}
           </p>
         </aside>
 
         <section className="mapSurface" aria-label="Route preview">
           <div ref={mapElementRef} className="embeddedMap" aria-label="Interactive route map" />
+          {mapOverlayText ? (
+            <div className="mapOverlay" role="status" aria-live="polite">
+              <span className="spinner" aria-hidden="true" />
+              <strong>{mapOverlayText}</strong>
+            </div>
+          ) : null}
 
           <div className="stats">
             <div>

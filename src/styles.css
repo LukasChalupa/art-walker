@@ -311,6 +311,47 @@ button:disabled {
   background: #e7e2d7;
 }
 
+.mapOverlay {
+  position: absolute;
+  z-index: 900;
+  top: 16px;
+  left: 50%;
+  display: inline-flex;
+  max-width: min(520px, calc(100% - 32px));
+  align-items: center;
+  gap: 10px;
+  padding: 12px 14px;
+  color: #273043;
+  background: rgba(255, 250, 241, 0.94);
+  border: 1px solid #ded5c5;
+  border-radius: 8px;
+  box-shadow: 0 14px 36px rgba(39, 48, 67, 0.18);
+  transform: translateX(-50%);
+}
+
+.mapOverlay strong {
+  overflow: hidden;
+  font-size: 0.9rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.spinner {
+  width: 18px;
+  height: 18px;
+  flex: 0 0 auto;
+  border: 3px solid #eadfce;
+  border-top-color: #fc4c02;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .leaflet-container {
   font-family: inherit;
 }
