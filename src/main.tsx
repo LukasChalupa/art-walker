@@ -214,6 +214,13 @@ const matchConfig = {
   startDriftPenalty: 0.025,
   outsideStartPenalty: 0.25,
   stitchedStartPenalty: 0.015,
+  gentleTurnRadians: Math.PI / 5,
+  turnPenaltyWeight: 34,
+  uTurnPenalty: 420,
+  repeatedEdgePenalty: 180,
+  reverseEdgePenalty: 320,
+  deadEndPenalty: 260,
+  pathCacheBudgetStepMeters: 80,
   maxSkippedWaypointRatio: 0.85,
   skippedWaypointPenalty: 260,
 };
@@ -1079,10 +1086,59 @@ function graphDistance(route: GraphNode[]) {
   }, 0);
 }
 
+function edgeKey(from: string, to: string) {
+  return `${from}->${to}`;
+}
+
+function turnRadians(prev: GraphNode, current: GraphNode, next: GraphNode) {
+  const incoming = Math.atan2(current.y - prev.y, current.x - prev.x);
+  const outgoing = Math.atan2(next.y - current.y, next.x - current.x);
+  return Math.abs(Math.atan2(Math.sin(outgoing - incoming), Math.cos(outgoing - incoming)));
+}
+
+function turnQualityPenalty(prev: GraphNode, current: GraphNode, next: GraphNode) {
+  const angle = turnRadians(prev, current, next);
+  const softTurn = Math.max(0, angle - matchConfig.gentleTurnRadians);
+  const uTurnPenalty = angle > Math.PI * 0.78 ? matchConfig.uTurnPenalty : 0;
+  return softTurn * softTurn * matchConfig.turnPenaltyWeight + uTurnPenalty;
+}
+
+function routeQualityPenalty(
+  graph: RoadGraph,
+  route: GraphNode[],
+  existingEdgeVisits = new Map<string, number>(),
+) {
+  const visits = new Map(existingEdgeVisits);
+  let penalty = 0;
+
+  route.slice(1).forEach((node, index) => {
+    const prev = route[index];
+    const forwardKey = edgeKey(prev.id, node.id);
+    const reverseKey = edgeKey(node.id, prev.id);
+    const forwardVisits = visits.get(forwardKey) ?? 0;
+    const reverseVisits = visits.get(reverseKey) ?? 0;
+
+    penalty += forwardVisits * matchConfig.repeatedEdgePenalty;
+    penalty += reverseVisits * matchConfig.reverseEdgePenalty;
+    visits.set(forwardKey, forwardVisits + 1);
+
+    const degree = graph.edges.get(node.id)?.length ?? 0;
+    if (degree <= 1) {
+      penalty += matchConfig.deadEndPenalty * (index < route.length - 2 ? 1.35 : 0.65);
+    }
+
+    if (index >= 1) {
+      penalty += turnQualityPenalty(route[index - 1], prev, node);
+    }
+  });
+
+  return { penalty, visits };
+}
+
 function routeUsesOnlyGraphEdges(graph: RoadGraph, route: GraphNode[]) {
   return route.slice(1).every((node, index) => {
     const prev = route[index];
-    return graph.edgeKeys.has(`${prev.id}->${node.id}`);
+    return graph.edgeKeys.has(edgeKey(prev.id, node.id));
   });
 }
 
@@ -1091,7 +1147,7 @@ function expandRouteGeometry(graph: RoadGraph, route: GraphNode[]) {
 
   route.slice(1).forEach((node, index) => {
     const prev = route[index];
-    const geometry = graph.edgeGeometries.get(`${prev.id}->${node.id}`);
+    const geometry = graph.edgeGeometries.get(edgeKey(prev.id, node.id));
     if (!geometry?.length) return;
     expanded.push(...(expanded.length ? geometry.slice(1) : geometry));
   });
@@ -1222,11 +1278,24 @@ function stitchWalkableRoute(graph: RoadGraph, waypoints: GraphNode[], segmentBu
 
   type StitchState = {
     connectedLegs: number;
+    edgeVisits: Map<string, number>;
     index: number;
     route: GraphNode[];
     score: number;
     skippedWaypoints: number;
   };
+
+  const pathCache = new Map<string, GraphNode[] | null>();
+
+  function cachedShortestPath(from: GraphNode, target: GraphNode, maxMeters: number) {
+    const budget = Math.ceil(maxMeters / matchConfig.pathCacheBudgetStepMeters) * matchConfig.pathCacheBudgetStepMeters;
+    const cacheKey = `${from.id}:${target.id}:${budget}`;
+    if (pathCache.has(cacheKey)) return pathCache.get(cacheKey) ?? null;
+
+    const path = shortestWalkablePath(graph, from, target, budget);
+    pathCache.set(cacheKey, path);
+    return path;
+  }
 
   function futureFitPenalty(node: GraphNode, startIndex: number) {
     const futureTargets = waypoints.slice(
@@ -1243,6 +1312,7 @@ function stitchWalkableRoute(graph: RoadGraph, waypoints: GraphNode[], segmentBu
 
   let beam: StitchState[] = [{
     connectedLegs: 0,
+    edgeVisits: new Map(),
     index: 1,
     route: [waypoints[0]],
     score: 0,
@@ -1276,12 +1346,7 @@ function stitchWalkableRoute(graph: RoadGraph, waypoints: GraphNode[], segmentBu
         const skipped = targetIndex - state.index;
         if (state.skippedWaypoints + skipped > maxSkippedWaypoints) continue;
 
-        const path = shortestWalkablePath(
-          graph,
-          from,
-          waypoints[targetIndex],
-          segmentBudgetMeters * (1 + skipped * 0.45),
-        );
+        const path = cachedShortestPath(from, waypoints[targetIndex], segmentBudgetMeters * (1 + skipped * 0.45));
         if (!path || path.length < 2) continue;
 
         const end = path[path.length - 1];
@@ -1289,12 +1354,14 @@ function stitchWalkableRoute(graph: RoadGraph, waypoints: GraphNode[], segmentBu
         const distancePenalty = graphDistance(path) * 0.018;
         const skippedPenalty = skipped * matchConfig.skippedWaypointPenalty;
         const fitPenalty = futureFitPenalty(end, targetIndex + 1);
+        const quality = routeQualityPenalty(graph, path, state.edgeVisits);
 
         nextBeam.push({
           connectedLegs: state.connectedLegs + 1,
+          edgeVisits: quality.visits,
           index: targetIndex + 1,
           route,
-          score: state.score + distancePenalty + skippedPenalty + fitPenalty,
+          score: state.score + distancePenalty + skippedPenalty + fitPenalty + quality.penalty,
           skippedWaypoints: state.skippedWaypoints + skipped,
         });
       }
@@ -1346,12 +1413,15 @@ function fallbackWalkableRoute(graph: RoadGraph, center: LatLng, kilometers: num
     const best = edges
       .map(({ edge, next }) => {
         const edgeKey = `${current.id}->${next.id}`;
+        const reverseKey = `${next.id}->${current.id}`;
         const heading = Math.atan2(next.y - current.y, next.x - current.x);
         const headingPenalty = Math.abs(Math.atan2(Math.sin(heading - preferredHeading), Math.cos(heading - preferredHeading)));
         const backtrackPenalty = next.id === previousId ? 1.5 : 0;
         const usedPenalty = (edgeVisits.get(edgeKey) ?? 0) * 2.5;
+        const reversePenalty = (edgeVisits.get(reverseKey) ?? 0) * 4.5;
+        const degreePenalty = (graph.edges.get(next.id)?.length ?? 0) <= 1 ? 2.2 : 0;
         const overshootPenalty = Math.max(0, meters + edge.weight - targetMeters * 1.15) / 80;
-        return { edge, next, score: headingPenalty + backtrackPenalty + usedPenalty + overshootPenalty };
+        return { edge, next, score: headingPenalty + backtrackPenalty + usedPenalty + reversePenalty + degreePenalty + overshootPenalty };
       })
       .sort((a, b) => a.score - b.score)[0];
 
@@ -1460,7 +1530,8 @@ function roadMatchedRoute(graph: RoadGraph, variants: ShapeVariant[], center: La
       const startOffset = Math.hypot(stitched.route[0].x, stitched.route[0].y);
       const startPenalty = Math.max(0, startOffset - startRangeMeters) * matchConfig.outsideStartPenalty
         + startOffset * matchConfig.stitchedStartPenalty;
-      const score = candidate.score + distancePenalty + detailPenalty + skippedPenalty + startPenalty;
+      const qualityPenalty = routeQualityPenalty(graph, stitched.route).penalty * 0.35;
+      const score = candidate.score + distancePenalty + detailPenalty + skippedPenalty + startPenalty + qualityPenalty;
 
       return { score, route: stitched.route };
     })
