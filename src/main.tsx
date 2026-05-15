@@ -85,6 +85,8 @@ type MatchTiming = {
   rankedRoutes?: number;
   selectedRouteRank?: number;
   choicePoolSize?: number;
+  shapeErrorMeters?: number;
+  anchorErrorMeters?: number;
   startOffsetMeters?: number;
 };
 
@@ -108,6 +110,22 @@ type ShapeVariant = {
   name: string;
   points: Point[];
   penalty: number;
+};
+
+type PlacementCandidate = {
+  primaryTargets: Point[];
+  targets: Point[];
+  startDrift: number;
+  shapePenalty: number;
+  rotationPenalty: number;
+};
+
+type ShapeScore = {
+  anchorError: number;
+  maxError: number;
+  meanError: number;
+  orderedError: number;
+  total: number;
 };
 
 type ObstaclePolygon = {
@@ -174,7 +192,8 @@ const matchConfig = {
   roadNodeSpacingMeters: 20,
   maxRenderedSegmentMeters: 10,
   targetPoints: 48,
-  topCandidates: 84,
+  topCandidates: 140,
+  rawPreselectCandidates: 460,
   minRoadSearchRadiusMeters: 700,
   maxRoadSearchRadiusMeters: 3200,
   roadSearchPaddingMeters: 220,
@@ -209,13 +228,25 @@ const matchConfig = {
   heuristicWeight: 1.25,
   shapeVariantLimit: 6,
   shapeVariantPenalty: 520,
-  randomCandidatesPerVariant: 520,
+  randomCandidatesPerVariant: 1100,
   randomScaleMin: 0.66,
   randomScaleMax: 1.32,
   routeChoicePoolSize: 8,
-  routeChoiceScoreWindowRatio: 0.2,
-  routeChoiceMinScoreWindow: 280,
-  routeChoiceScoreSharpness: 1.1,
+  routeChoiceScoreWindowRatio: 0.1,
+  routeChoiceMinScoreWindow: 180,
+  routeChoiceScoreSharpness: 1.8,
+  mapMatchNearestNodes: 5,
+  mapMatchBeamWidth: 7,
+  mapMatchTransitionWeight: 0.2,
+  mapMatchHeadingWeight: 55,
+  mapMatchDuplicatePenalty: 180,
+  shapeScoreSamples: 96,
+  shapeAnchorLimit: 10,
+  shapeMeanWeight: 18,
+  shapeOrderedWeight: 4,
+  shapeAnchorWeight: 24,
+  shapeMaxWeight: 3,
+  rawCandidateScoreWeight: 0.08,
   waypointLookahead: 5,
   stitchBeamWidth: 5,
   futureFitLookahead: 4,
@@ -777,19 +808,76 @@ async function prunePersistentRoadGraphs() {
   await idbTransactionDone(writeTransaction);
 }
 
-async function readPersistentRoadGraph(cacheKey: string) {
+function roadGraphCacheKeyParts(center: LatLng, radiusMeters: number, profile: RoadQueryProfile) {
+  const radiusBucket = Math.round(radiusMeters / 100) * 100;
+  const prefix = [
+    matchConfig.graphCacheVersion,
+    profile.id,
+    `spacing-${matchConfig.roadNodeSpacingMeters}`,
+    center.lat.toFixed(4),
+    center.lng.toFixed(4),
+  ].join(":");
+
+  return {
+    cacheKey: `${prefix}:${radiusBucket}`,
+    prefix,
+    radiusBucket,
+  };
+}
+
+function radiusBucketFromCacheKey(cacheKey: string) {
+  const parts = cacheKey.split(":");
+  const radiusBucket = Number(parts[parts.length - 1]);
+  return Number.isFinite(radiusBucket) ? radiusBucket : null;
+}
+
+function findMemoryRoadGraphCovering(center: LatLng, radiusMeters: number, profile: RoadQueryProfile) {
+  const { cacheKey, prefix, radiusBucket } = roadGraphCacheKeyParts(center, radiusMeters, profile);
+  const exact = roadGraphCache.get(cacheKey);
+  if (exact) return { graph: exact, radiusMeters: radiusBucket };
+
+  const covering = Array.from(roadGraphCache.entries())
+    .flatMap(([key, graph]) => {
+      const cachedRadius = radiusBucketFromCacheKey(key);
+      return key.startsWith(`${prefix}:`) && cachedRadius !== null && cachedRadius >= radiusBucket
+        ? [{ graph, radiusMeters: cachedRadius }]
+        : [];
+    })
+    .sort((a, b) => a.radiusMeters - b.radiusMeters)[0];
+
+  return covering ?? null;
+}
+
+async function readPersistentRoadGraphCovering(center: LatLng, radiusMeters: number, profile: RoadQueryProfile) {
   try {
     const database = await openRoadGraphDb();
     if (!database) return null;
 
+    const { prefix, radiusBucket } = roadGraphCacheKeyParts(center, radiusMeters, profile);
     const transaction = database.transaction(roadGraphStoreName, "readonly");
-    const record = await idbRequest<RoadGraphCacheRecord | undefined>(
-      transaction.objectStore(roadGraphStoreName).get(cacheKey),
+    const records = await idbRequest<RoadGraphCacheRecord[]>(
+      transaction.objectStore(roadGraphStoreName).getAll(),
     );
     await idbTransactionDone(transaction);
-    if (!record || Date.now() - record.createdAt > roadGraphCacheMaxAgeMs) return null;
 
-    return reviveRoadGraph(record.graph);
+    const now = Date.now();
+    const record = records
+      .flatMap((candidate) => {
+        const cachedRadius = radiusBucketFromCacheKey(candidate.key);
+        return candidate.key.startsWith(`${prefix}:`)
+          && cachedRadius !== null
+          && cachedRadius >= radiusBucket
+          && now - candidate.createdAt <= roadGraphCacheMaxAgeMs
+          ? [{ record: candidate, radiusMeters: cachedRadius }]
+          : [];
+      })
+      .sort((a, b) => a.radiusMeters - b.radiusMeters)[0];
+    if (!record) return null;
+
+    return {
+      graph: reviveRoadGraph(record.record.graph),
+      radiusMeters: record.radiusMeters,
+    };
   } catch {
     return null;
   }
@@ -817,23 +905,23 @@ async function fetchRoadGraph(
   center: LatLng,
   radiusMeters: number,
   profile: RoadQueryProfile,
-): Promise<{ graph: RoadGraph; source: RoadGraphSource }> {
-  const cacheKey = [
-    matchConfig.graphCacheVersion,
-    profile.id,
-    `spacing-${matchConfig.roadNodeSpacingMeters}`,
-    center.lat.toFixed(4),
-    center.lng.toFixed(4),
-    Math.round(radiusMeters / 100) * 100,
-  ].join(":");
-  const cached = roadGraphCache.get(cacheKey);
-  if (cached) return { graph: cached, source: "memory" };
-
-  const persistent = await readPersistentRoadGraph(cacheKey);
-  if (persistent) {
-    roadGraphCache.set(cacheKey, persistent);
-    return { graph: persistent, source: "persistent" };
+  onPhase?: (message: string) => void,
+): Promise<{ graph: RoadGraph; source: RoadGraphSource; radiusMeters: number }> {
+  const { cacheKey, radiusBucket } = roadGraphCacheKeyParts(center, radiusMeters, profile);
+  const cached = findMemoryRoadGraphCovering(center, radiusMeters, profile);
+  if (cached) {
+    onPhase?.(`Using cached ${profile.label} within ${Math.round(cached.radiusMeters)} m...`);
+    return { graph: cached.graph, source: "memory", radiusMeters: cached.radiusMeters };
   }
+
+  const persistent = await readPersistentRoadGraphCovering(center, radiusMeters, profile);
+  if (persistent) {
+    onPhase?.(`Restoring saved ${profile.label} within ${Math.round(persistent.radiusMeters)} m...`);
+    roadGraphCache.set(cacheKey, persistent.graph);
+    return { graph: persistent.graph, source: "persistent", radiusMeters: persistent.radiusMeters };
+  }
+
+  onPhase?.(`Loading ${profile.label} within ${Math.round(radiusMeters)} m from OpenStreetMap...`);
 
   const extraFilters = profile.extraFilters.length
     ? `\n${profile.extraFilters.map((filter) => `        ${filter}`).join("\n")}`
@@ -1023,7 +1111,7 @@ async function fetchRoadGraph(
   const graph = { nodes: graphNodes, edges, edgeKeys, edgeGeometries, nodeGrid: buildNodeGrid(graphNodes, edges), segments, rejectedSegments };
   roadGraphCache.set(cacheKey, graph);
   void writePersistentRoadGraph(cacheKey, graph);
-  return { graph, source: "network" };
+  return { graph, source: "network", radiusMeters: radiusBucket };
 }
 
 async function fetchUsableRoadGraph(
@@ -1033,26 +1121,24 @@ async function fetchUsableRoadGraph(
 ) {
   const compactProfile = roadQueryProfiles.compact;
   const broadProfile = roadQueryProfiles.broad;
-  let compactResult: { graph: RoadGraph; source: RoadGraphSource } | null = null;
+  let compactResult: { graph: RoadGraph; source: RoadGraphSource; radiusMeters: number } | null = null;
 
   try {
-    onPhase(`Loading ${compactProfile.label} within ${Math.round(radiusMeters)} m...`);
-    const result = await fetchRoadGraph(center, radiusMeters, compactProfile);
+    const result = await fetchRoadGraph(center, radiusMeters, compactProfile, onPhase);
     compactResult = result;
     if (result.graph.segments.length >= matchConfig.compactRoadMinSegments) {
-      return { ...result, profile: compactProfile, radiusMeters };
+      return { ...result, profile: compactProfile };
     }
   } catch {
     // Fall through to the broader profile below.
   }
 
   const broadRadius = Math.min(radiusMeters * matchConfig.compactRoadRadiusBoost, matchConfig.maxRoadSearchRadiusMeters);
-  onPhase(`Expanding road search to ${Math.round(broadRadius)} m...`);
   try {
-    const result = await fetchRoadGraph(center, broadRadius, broadProfile);
-    return { ...result, profile: broadProfile, radiusMeters: broadRadius };
+    const result = await fetchRoadGraph(center, broadRadius, broadProfile, onPhase);
+    return { ...result, profile: broadProfile };
   } catch (error) {
-    if (compactResult) return { ...compactResult, profile: compactProfile, radiusMeters };
+    if (compactResult) return { ...compactResult, profile: compactProfile };
     throw error;
   }
 }
@@ -1096,11 +1182,157 @@ function nearestNode(graph: RoadGraph, point: Point): { node: GraphNode | null; 
   return { node: best, distance: bestDistance };
 }
 
+function nearestNodes(graph: RoadGraph, point: Point, limit: number): Array<{ node: GraphNode; distance: number }> {
+  const { cellSize, cells, nodes } = graph.nodeGrid;
+  const cellX = Math.floor(point.x / cellSize);
+  const cellY = Math.floor(point.y / cellSize);
+  const seen = new Set<string>();
+  const candidates: Array<{ node: GraphNode; distance: number }> = [];
+
+  function addNode(node: GraphNode) {
+    if (seen.has(node.id)) return;
+    seen.add(node.id);
+    candidates.push({ node, distance: Math.hypot(node.x - point.x, node.y - point.y) });
+  }
+
+  for (let ring = 0; ring <= 8; ring += 1) {
+    for (let x = cellX - ring; x <= cellX + ring; x += 1) {
+      for (let y = cellY - ring; y <= cellY + ring; y += 1) {
+        if (ring > 0 && x !== cellX - ring && x !== cellX + ring && y !== cellY - ring && y !== cellY + ring) {
+          continue;
+        }
+
+        (cells.get(`${x},${y}`) ?? []).forEach(addNode);
+      }
+    }
+
+    if (candidates.length >= limit * 4) break;
+  }
+
+  if (!candidates.length) {
+    nodes.forEach(addNode);
+  }
+
+  return candidates
+    .sort((a, b) => a.distance - b.distance)
+    .slice(0, limit);
+}
+
 function graphDistance(route: GraphNode[]) {
   return route.slice(1).reduce((total, node, index) => {
     const prev = route[index];
     return total + Math.hypot(node.x - prev.x, node.y - prev.y);
   }, 0);
+}
+
+function localDistance(a: Point, b: Point) {
+  return Math.hypot(a.x - b.x, a.y - b.y);
+}
+
+function angleBetweenSegments(a: Point, b: Point, c: Point) {
+  const first = { x: b.x - a.x, y: b.y - a.y };
+  const second = { x: c.x - b.x, y: c.y - b.y };
+  const firstLength = Math.max(localDistance(a, b), 0.001);
+  const secondLength = Math.max(localDistance(b, c), 0.001);
+  const cross = first.x * second.y - first.y * second.x;
+  const dot = first.x * second.x + first.y * second.y;
+  return Math.abs(Math.atan2(cross / (firstLength * secondLength), dot / (firstLength * secondLength)));
+}
+
+function pointToSegmentDistance(point: Point, start: Point, end: Point) {
+  const lengthSquared = (end.x - start.x) ** 2 + (end.y - start.y) ** 2;
+  if (lengthSquared <= 0.000001) return localDistance(point, start);
+
+  const progress = Math.max(
+    0,
+    Math.min(1, ((point.x - start.x) * (end.x - start.x) + (point.y - start.y) * (end.y - start.y)) / lengthSquared),
+  );
+  return localDistance(point, {
+    x: start.x + (end.x - start.x) * progress,
+    y: start.y + (end.y - start.y) * progress,
+  });
+}
+
+function pointToPolylineDistance(point: Point, polyline: Point[]) {
+  if (!polyline.length) return Number.POSITIVE_INFINITY;
+  if (polyline.length === 1) return localDistance(point, polyline[0]);
+
+  return polyline.slice(1).reduce((best, current, index) => {
+    const previous = polyline[index];
+    return Math.min(best, pointToSegmentDistance(point, previous, current));
+  }, Number.POSITIVE_INFINITY);
+}
+
+function averagePolylineDistance(points: Point[], polyline: Point[]) {
+  if (!points.length || !polyline.length) return Number.POSITIVE_INFINITY;
+  return points.reduce((total, point) => total + pointToPolylineDistance(point, polyline), 0) / points.length;
+}
+
+function maxPolylineDistance(points: Point[], polyline: Point[]) {
+  if (!points.length || !polyline.length) return Number.POSITIVE_INFINITY;
+  return points.reduce((maximum, point) => Math.max(maximum, pointToPolylineDistance(point, polyline)), 0);
+}
+
+function shapeAnchorPoints(points: Point[]) {
+  if (points.length <= 2) return points;
+
+  const anchors = new Map<number, number>();
+  function addAnchor(index: number, score: number) {
+    anchors.set(index, Math.max(anchors.get(index) ?? 0, score));
+  }
+
+  addAnchor(0, 10);
+  addAnchor(points.length - 1, 10);
+
+  const extrema = [
+    { score: 8, index: points.reduce((best, point, index) => point.x < points[best].x ? index : best, 0) },
+    { score: 8, index: points.reduce((best, point, index) => point.x > points[best].x ? index : best, 0) },
+    { score: 8, index: points.reduce((best, point, index) => point.y < points[best].y ? index : best, 0) },
+    { score: 8, index: points.reduce((best, point, index) => point.y > points[best].y ? index : best, 0) },
+  ];
+  extrema.forEach(({ index, score }) => addAnchor(index, score));
+
+  for (let index = 1; index < points.length - 1; index += 1) {
+    const turn = angleBetweenSegments(points[index - 1], points[index], points[index + 1]);
+    const localScale = Math.min(localDistance(points[index - 1], points[index]), localDistance(points[index], points[index + 1]));
+    addAnchor(index, turn * Math.sqrt(Math.max(localScale, 1)));
+  }
+
+  return Array.from(anchors.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, matchConfig.shapeAnchorLimit)
+    .sort((a, b) => a[0] - b[0])
+    .map(([index]) => points[index]);
+}
+
+function scoreRouteAgainstShape(routePoints: Point[], targetPoints: Point[]): ShapeScore {
+  if (routePoints.length < 2 || targetPoints.length < 2) {
+    return {
+      anchorError: Number.POSITIVE_INFINITY,
+      maxError: Number.POSITIVE_INFINITY,
+      meanError: Number.POSITIVE_INFINITY,
+      orderedError: Number.POSITIVE_INFINITY,
+      total: Number.POSITIVE_INFINITY,
+    };
+  }
+
+  const routeSample = resample(routePoints, matchConfig.shapeScoreSamples);
+  const targetSample = resample(targetPoints, matchConfig.shapeScoreSamples);
+  const routeToTarget = averagePolylineDistance(routeSample, targetSample);
+  const targetToRoute = averagePolylineDistance(targetSample, routeSample);
+  const meanError = routeToTarget * 0.35 + targetToRoute * 0.65;
+  const orderedError = targetSample.reduce((total, target, index) => (
+    total + localDistance(target, routeSample[Math.min(index, routeSample.length - 1)])
+  ), 0) / targetSample.length;
+  const anchors = shapeAnchorPoints(targetPoints);
+  const anchorError = averagePolylineDistance(anchors, routeSample);
+  const maxError = maxPolylineDistance(targetSample, routeSample);
+  const total = meanError * matchConfig.shapeMeanWeight
+    + orderedError * matchConfig.shapeOrderedWeight
+    + anchorError * matchConfig.shapeAnchorWeight
+    + maxError * matchConfig.shapeMaxWeight;
+
+  return { anchorError, maxError, meanError, orderedError, total };
 }
 
 function edgeKey(from: string, to: string) {
@@ -1191,6 +1423,80 @@ function chooseRouteCandidate<T extends { score: number }>(rankedRoutes: T[]) {
     candidate,
     poolSize: pool.length,
     selectedRank: rankedRoutes.indexOf(candidate) + 1,
+  };
+}
+
+function graphAwareWaypointRoute(graph: RoadGraph, targets: Point[]) {
+  if (targets.length < 2) return null;
+
+  type MatchState = {
+    node: GraphNode;
+    route: GraphNode[];
+    score: number;
+    snapTotal: number;
+  };
+
+  const options = targets.map((target) => nearestNodes(graph, target, matchConfig.mapMatchNearestNodes));
+  if (options.some((option) => !option.length)) return null;
+
+  let beam: MatchState[] = options[0].map(({ node, distance }) => ({
+    node,
+    route: [node],
+    score: distance * matchConfig.snapPenaltyWeight,
+    snapTotal: distance,
+  }));
+
+  for (let targetIndex = 1; targetIndex < targets.length && beam.length; targetIndex += 1) {
+    const previousTarget = targets[targetIndex - 1];
+    const target = targets[targetIndex];
+    const targetLength = Math.max(localDistance(previousTarget, target), 1);
+    const targetHeading = Math.atan2(target.y - previousTarget.y, target.x - previousTarget.x);
+    const nextBeam: MatchState[] = [];
+
+    beam.forEach((state) => {
+      options[targetIndex].forEach(({ node, distance }) => {
+        const previous = state.node;
+        const transitionLength = localDistance(previous, node);
+        const transitionHeading = Math.atan2(node.y - previous.y, node.x - previous.x);
+        const headingPenalty = Number.isFinite(transitionHeading)
+          ? Math.abs(Math.atan2(Math.sin(transitionHeading - targetHeading), Math.cos(transitionHeading - targetHeading)))
+            * matchConfig.mapMatchHeadingWeight
+          : 0;
+        const transitionPenalty = Math.abs(transitionLength - targetLength) * matchConfig.mapMatchTransitionWeight;
+        const duplicatePenalty = state.route.some((routeNode) => routeNode.id === node.id)
+          ? matchConfig.mapMatchDuplicatePenalty
+          : 0;
+
+        nextBeam.push({
+          node,
+          route: [...state.route, node],
+          score: state.score
+            + distance * matchConfig.snapPenaltyWeight
+            + transitionPenalty
+            + headingPenalty
+            + duplicatePenalty,
+          snapTotal: state.snapTotal + distance,
+        });
+      });
+    });
+
+    beam = nextBeam
+      .sort((a, b) => a.score - b.score)
+      .slice(0, matchConfig.mapMatchBeamWidth);
+  }
+
+  const best = beam.sort((a, b) => a.score - b.score)[0];
+  if (!best) return null;
+
+  const route = best.route.filter((node, index, array) => node.id !== array[index - 1]?.id);
+  if (route.length < 4) return null;
+
+  const uniqueCount = new Set(best.route.map((node) => node.id)).size;
+  return {
+    route,
+    score: best.score,
+    snapPenalty: best.snapTotal / targets.length,
+    duplicatePenalty: (best.route.length - uniqueCount) * matchConfig.duplicateWaypointPenalty,
   };
 }
 
@@ -1506,7 +1812,8 @@ function roadMatchedRoute(graph: RoadGraph, variants: ShapeVariant[], center: La
   const scales = matchConfig.scales;
   const rotations = matchConfig.rotations;
   const anchors = startAnchors(startRangeMeters);
-  const rawCandidates: Array<{ targets: Point[]; startDrift: number; shapePenalty: number; rotationPenalty: number }> = [];
+  const primaryBaseTargets = targetMeters(variants[0]?.points ?? [{ x: 0, y: 0 }, { x: 1, y: 0 }], kilometers);
+  const rawCandidates: PlacementCandidate[] = [];
 
   variants.forEach((variant) => {
     const baseTargets = targetMeters(variant.points, kilometers);
@@ -1516,14 +1823,16 @@ function roadMatchedRoute(graph: RoadGraph, variants: ShapeVariant[], center: La
         const rotatedStart = transformPoints([baseTargets[0]], scale, rotation, { x: 0, y: 0 })[0];
 
         for (const startAnchor of anchors) {
+          const offset = {
+            x: startAnchor.x - rotatedStart.x,
+            y: startAnchor.y - rotatedStart.y,
+          };
           rawCandidates.push({
+            primaryTargets: transformPoints(primaryBaseTargets, scale, rotation, offset),
             startDrift: Math.hypot(startAnchor.x, startAnchor.y),
             shapePenalty: variant.penalty,
             rotationPenalty: rotationPreferencePenalty(rotation),
-            targets: transformPoints(baseTargets, scale, rotation, {
-              x: startAnchor.x - rotatedStart.x,
-              y: startAnchor.y - rotatedStart.y,
-            }),
+            targets: transformPoints(baseTargets, scale, rotation, offset),
           });
         }
       }
@@ -1534,20 +1843,22 @@ function roadMatchedRoute(graph: RoadGraph, variants: ShapeVariant[], center: La
       const rotation = Math.random() * Math.PI * 2;
       const startAnchor = randomStartAnchor(startRangeMeters);
       const rotatedStart = transformPoints([baseTargets[0]], scale, rotation, { x: 0, y: 0 })[0];
+      const offset = {
+        x: startAnchor.x - rotatedStart.x,
+        y: startAnchor.y - rotatedStart.y,
+      };
 
       rawCandidates.push({
+        primaryTargets: transformPoints(primaryBaseTargets, scale, rotation, offset),
         startDrift: Math.hypot(startAnchor.x, startAnchor.y),
         shapePenalty: variant.penalty + 120,
         rotationPenalty: rotationPreferencePenalty(rotation),
-        targets: transformPoints(baseTargets, scale, rotation, {
-          x: startAnchor.x - rotatedStart.x,
-          y: startAnchor.y - rotatedStart.y,
-        }),
+        targets: transformPoints(baseTargets, scale, rotation, offset),
       });
     }
   });
 
-  const rawRanked = rawCandidates
+  const rawPreselected = rawCandidates
     .map((candidate) => {
       const snapped = candidate.targets.map((point) => nearestNode(graph, point));
       const route: GraphNode[] = snapped
@@ -1572,9 +1883,27 @@ function roadMatchedRoute(graph: RoadGraph, variants: ShapeVariant[], center: La
         + candidate.rotationPenalty
         + candidate.shapePenalty;
 
-      return { score, route };
+      return { ...candidate, score, route };
     })
-    .filter((candidate): candidate is { score: number; route: GraphNode[] } => Boolean(candidate))
+    .filter((candidate): candidate is PlacementCandidate & { score: number; route: GraphNode[] } => Boolean(candidate))
+    .sort((a, b) => a.score - b.score)
+    .slice(0, matchConfig.rawPreselectCandidates);
+
+  const rawRanked = rawPreselected
+    .map((candidate) => {
+      const matched = graphAwareWaypointRoute(graph, candidate.targets);
+      if (!matched) return { ...candidate, score: candidate.score + 400 };
+
+      return {
+        ...candidate,
+        route: matched.route,
+        score: candidate.score * 0.35
+          + matched.score * 0.65
+          + matched.duplicatePenalty
+          + candidate.rotationPenalty
+          + candidate.shapePenalty,
+      };
+    })
     .sort((a, b) => a.score - b.score)
     .slice(0, matchConfig.topCandidates);
 
@@ -1584,6 +1913,8 @@ function roadMatchedRoute(graph: RoadGraph, variants: ShapeVariant[], center: La
       if (!stitched) return null;
 
       const routeDistance = graphDistance(stitched.route);
+      const routeShapePoints = expandRouteGeometry(graph, stitched.route).map((point) => ({ x: point.x, y: point.y }));
+      const shapeScore = scoreRouteAgainstShape(routeShapePoints.length >= 2 ? routeShapePoints : stitched.route, candidate.primaryTargets);
       const severeShortfall = Math.max(0, targetDistanceMeters * matchConfig.minRouteDistanceRatio - routeDistance);
       const distancePenalty = Math.abs(routeDistance - targetDistanceMeters) * matchConfig.distancePenaltyWeight
         + severeShortfall * matchConfig.shortRoutePenaltyWeight;
@@ -1593,11 +1924,23 @@ function roadMatchedRoute(graph: RoadGraph, variants: ShapeVariant[], center: La
       const startPenalty = Math.max(0, startOffset - startRangeMeters) * matchConfig.outsideStartPenalty
         + startOffset * matchConfig.stitchedStartPenalty;
       const qualityPenalty = routeQualityPenalty(graph, stitched.route).penalty * 0.18;
-      const score = candidate.score + distancePenalty + detailPenalty + skippedPenalty + startPenalty + qualityPenalty;
+      const score = shapeScore.total
+        + candidate.score * matchConfig.rawCandidateScoreWeight
+        + distancePenalty
+        + detailPenalty
+        + skippedPenalty * 0.35
+        + startPenalty
+        + qualityPenalty;
 
-      return { routeDistance, score, route: stitched.route };
+      return { routeDistance, score, route: stitched.route, shapeScore, targetPoints: candidate.primaryTargets };
     })
-    .filter((candidate): candidate is { routeDistance: number; score: number; route: GraphNode[] } => Boolean(candidate))
+    .filter((candidate): candidate is {
+      routeDistance: number;
+      score: number;
+      route: GraphNode[];
+      shapeScore: ShapeScore;
+      targetPoints: Point[];
+    } => Boolean(candidate))
     .sort((a, b) => a.score - b.score);
 
   const chosenCandidate = chooseRouteCandidate(rankedRoutes);
@@ -1613,16 +1956,22 @@ function roadMatchedRoute(graph: RoadGraph, variants: ShapeVariant[], center: La
       matchConfig.maxRenderedSegmentMeters,
     )
     : [];
+  const targetLatLng = bestCandidate
+    ? resample(bestCandidate.targetPoints, 260).map((point) => ({ ...point, ...fromMeters(point, center) }))
+    : [];
 
   const referencePoints = graph.segments.flatMap((segment) => [segment.a, segment.b]);
   return {
+    anchorErrorMeters: bestCandidate?.shapeScore.anchorError,
     distanceFallbackUsed: false,
     fallbackUsed: !bestCandidate && shouldUseFallback,
     choicePoolSize: chosenCandidate.poolSize,
     points: withPreviewPoints(routeLatLng, center, referencePoints),
     rankedRoutes: rankedRoutes.length,
     selectedRouteRank: chosenCandidate.selectedRank,
+    shapeErrorMeters: bestCandidate?.shapeScore.meanError,
     startOffsetMeters,
+    targetPoints: targetLatLng,
   };
 }
 
@@ -1749,6 +2098,7 @@ function App() {
   const [drawingPoints, setDrawingPoints] = useState<Point[]>([]);
   const [isDrawingShape, setIsDrawingShape] = useState(false);
   const [roadRoute, setRoadRoute] = useState<RoutePoint[] | null>(null);
+  const [targetRoute, setTargetRoute] = useState<RoutePoint[] | null>(null);
   const [roadSegments, setRoadSegments] = useState<RoadSegment[]>([]);
   const [roadCenter, setRoadCenter] = useState<LatLng | null>(null);
   const [roadStatus, setRoadStatus] = useState("Use Match roads to build the GPX from real walkable streets.");
@@ -1762,6 +2112,7 @@ function App() {
   const drawingPointsRef = useRef<Point[]>([]);
   const mapElementRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<L.Map | null>(null);
+  const targetLayerRef = useRef<L.Polyline | null>(null);
   const routeLayerRef = useRef<L.Polyline | null>(null);
   const roadLayerRef = useRef<L.LayerGroup | null>(null);
   const centerMarkerRef = useRef<L.CircleMarker | null>(null);
@@ -1811,6 +2162,7 @@ function App() {
   function clearRoadMatch() {
     matchRequestRef.current += 1;
     setRoadRoute(null);
+    setTargetRoute(null);
     setRoadSegments([]);
     setRoadCenter(null);
     setMatchTiming(null);
@@ -1917,7 +2269,7 @@ function App() {
     setIsMatchingRoads(true);
     setMatchTiming(null);
     setMatchPhase("Resolving start point...");
-    setRoadStatus("Searching OpenStreetMap for nearby walkable streets...");
+    setRoadStatus("Checking cached road graph, then loading OpenStreetMap only if needed...");
 
     try {
       const resolvedCenter = selectedLocation ?? await resolveLocation(location);
@@ -1953,6 +2305,7 @@ function App() {
       }
 
       setRoadRoute(matched);
+      setTargetRoute(matchedResult.targetPoints);
       setRoadSegments(graph.segments);
       setRoadCenter(resolvedCenter);
       setHasLoadedOnce(true);
@@ -1964,6 +2317,8 @@ function App() {
         rankedRoutes: matchedResult.rankedRoutes,
         selectedRouteRank: matchedResult.selectedRouteRank,
         choicePoolSize: matchedResult.choicePoolSize,
+        shapeErrorMeters: matchedResult.shapeErrorMeters,
+        anchorErrorMeters: matchedResult.anchorErrorMeters,
         startOffsetMeters: matchedResult.startOffsetMeters,
       });
       const matchedStats = routeStats(matched);
@@ -1978,11 +2333,15 @@ function App() {
       const startStatus = matchedResult.startOffsetMeters > 30
         ? `Start moved ${Math.round(matchedResult.startOffsetMeters)} m from the selected location.`
         : "Start stays near the selected location.";
+      const shapeStatus = typeof matchedResult.shapeErrorMeters === "number"
+        ? ` Shape error is about ${Math.round(matchedResult.shapeErrorMeters)} m; key points about ${Math.round(matchedResult.anchorErrorMeters ?? matchedResult.shapeErrorMeters)} m.`
+        : "";
       setMatchPhase("");
-      setRoadStatus(`${rankingStatus} ${startStatus} GPX distance is ${matchedStats.kilometers.toFixed(2)} km.`);
+      setRoadStatus(`${rankingStatus} ${startStatus} GPX distance is ${matchedStats.kilometers.toFixed(2)} km.${shapeStatus}`);
     } catch (error) {
       if (requestId !== matchRequestRef.current) return;
       setRoadRoute(null);
+      setTargetRoute(null);
       setRoadSegments([]);
       setRoadCenter(null);
       if (!hasLoadedGraph) setGraphInfo(null);
@@ -2096,6 +2455,26 @@ function App() {
     if (routeLayerRef.current) {
       routeLayerRef.current.remove();
     }
+    if (targetLayerRef.current) {
+      targetLayerRef.current.remove();
+      targetLayerRef.current = null;
+    }
+    if (hasWalkableRoute && targetRoute?.length) {
+      targetLayerRef.current = L.polyline(
+        targetRoute.map((point) => L.latLng(point.lat, point.lng)),
+        {
+          color: "#273043",
+          weight: 3,
+          opacity: 0.36,
+          lineCap: "round",
+          lineJoin: "round",
+          dashArray: "5 9",
+          smoothFactor: 0,
+          noClip: true,
+          interactive: false,
+        },
+      ).addTo(map);
+    }
     routeLayerRef.current = L.polyline(routeLatLngs, {
       color: hasWalkableRoute ? "#fc4c02" : "#556070",
       weight: hasWalkableRoute ? 6 : 3,
@@ -2137,7 +2516,7 @@ function App() {
       const routeBounds = L.latLngBounds(routeLatLngs);
       map.fitBounds(routeBounds.pad(0.18), { animate: true, maxZoom: 16 });
     }
-  }, [route, roadSegments, hasWalkableRoute, center.lat, center.lng]);
+  }, [route, roadSegments, targetRoute, hasWalkableRoute, center.lat, center.lng]);
 
   useEffect(() => {
     const query = location.trim();
@@ -2317,7 +2696,7 @@ function App() {
             {isMatchingRoads
               ? "Calculating path..."
               : matchTiming
-                ? `Last calculation: ${formatMs(matchTiming.totalMs)} total / ${formatMs(matchTiming.roadSearchMs)} road data / ${formatMs(matchTiming.routeMs)} path${typeof matchTiming.rankedRoutes === "number" ? ` / ${matchTiming.rankedRoutes} ranked` : ""}${typeof matchTiming.choicePoolSize === "number" && matchTiming.choicePoolSize > 1 ? ` / picked ${matchTiming.selectedRouteRank ?? 1}/${matchTiming.choicePoolSize}` : ""}${typeof matchTiming.startOffsetMeters === "number" ? ` / start ${Math.round(matchTiming.startOffsetMeters)} m from pin` : ""}`
+                ? `Last calculation: ${formatMs(matchTiming.totalMs)} total / ${formatMs(matchTiming.roadSearchMs)} road data / ${formatMs(matchTiming.routeMs)} path${typeof matchTiming.rankedRoutes === "number" ? ` / ${matchTiming.rankedRoutes} ranked` : ""}${typeof matchTiming.choicePoolSize === "number" && matchTiming.choicePoolSize > 1 ? ` / picked ${matchTiming.selectedRouteRank ?? 1}/${matchTiming.choicePoolSize}` : ""}${typeof matchTiming.shapeErrorMeters === "number" ? ` / shape ${Math.round(matchTiming.shapeErrorMeters)}m` : ""}${typeof matchTiming.startOffsetMeters === "number" ? ` / start ${Math.round(matchTiming.startOffsetMeters)} m from pin` : ""}`
                 : "Last calculation: not run yet"}
           </p>
           <p className="status timing">
