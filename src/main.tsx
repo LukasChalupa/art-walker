@@ -87,6 +87,9 @@ type MatchTiming = {
   choicePoolSize?: number;
   shapeErrorMeters?: number;
   anchorErrorMeters?: number;
+  worstSegmentErrorMeters?: number;
+  segmentRepairsTried?: number;
+  selectedSegmentRepairs?: number;
   startOffsetMeters?: number;
 };
 
@@ -126,6 +129,14 @@ type ShapeScore = {
   meanError: number;
   orderedError: number;
   total: number;
+};
+
+type ShapeSegmentWindow = {
+  endProgress: number;
+  index: number;
+  maxError: number;
+  score: number;
+  startProgress: number;
 };
 
 type ObstaclePolygon = {
@@ -247,6 +258,14 @@ const matchConfig = {
   shapeAnchorWeight: 24,
   shapeMaxWeight: 3,
   rawCandidateScoreWeight: 0.08,
+  segmentScoreWindows: 8,
+  segmentRepairCandidateLimit: 24,
+  segmentRepairWindowLimit: 2,
+  segmentRepairMinErrorMeters: 55,
+  segmentRepairExtraPoints: 96,
+  segmentRepairWindowPadding: 0.05,
+  segmentRepairBudgetBoost: 1.18,
+  segmentRepairPenalty: 120,
   waypointLookahead: 5,
   stitchBeamWidth: 5,
   futureFitLookahead: 4,
@@ -1335,6 +1354,69 @@ function scoreRouteAgainstShape(routePoints: Point[], targetPoints: Point[]): Sh
   return { anchorError, maxError, meanError, orderedError, total };
 }
 
+function shapeSegmentWindows(routePoints: Point[], targetPoints: Point[]): ShapeSegmentWindow[] {
+  if (routePoints.length < 2 || targetPoints.length < 2) return [];
+
+  const routeSample = resample(routePoints, matchConfig.shapeScoreSamples);
+  const targetSample = resample(targetPoints, matchConfig.shapeScoreSamples);
+  const windowCount = Math.min(matchConfig.segmentScoreWindows, Math.max(1, Math.floor(targetSample.length / 4)));
+
+  return Array.from({ length: windowCount }, (_, index) => {
+    const startIndex = Math.floor(index * (targetSample.length - 1) / windowCount);
+    const endIndex = index === windowCount - 1
+      ? targetSample.length - 1
+      : Math.max(startIndex + 1, Math.floor((index + 1) * (targetSample.length - 1) / windowCount));
+    let total = 0;
+    let maxError = 0;
+    let count = 0;
+
+    for (let sampleIndex = startIndex; sampleIndex <= endIndex; sampleIndex += 1) {
+      const target = targetSample[sampleIndex];
+      const ordered = localDistance(target, routeSample[Math.min(sampleIndex, routeSample.length - 1)]);
+      const local = pointToPolylineDistance(target, routeSample);
+      const error = local * 0.75 + ordered * 0.25;
+      total += error;
+      maxError = Math.max(maxError, error);
+      count += 1;
+    }
+
+    return {
+      endProgress: endIndex / Math.max(targetSample.length - 1, 1),
+      index,
+      maxError,
+      score: total / Math.max(count, 1) + maxError * 0.2,
+      startProgress: startIndex / Math.max(targetSample.length - 1, 1),
+    };
+  }).sort((a, b) => b.score - a.score);
+}
+
+function repairTargetsForWindows(targetPoints: Point[], windows: ShapeSegmentWindow[]) {
+  const dense = resample(targetPoints, matchConfig.segmentRepairExtraPoints);
+  const samples = [
+    ...targetPoints.map((point, index) => ({
+      point,
+      progress: index / Math.max(targetPoints.length - 1, 1),
+    })),
+    ...dense.flatMap((point, index) => {
+      const progress = index / Math.max(dense.length - 1, 1);
+      const insideRepairWindow = windows.some((window) =>
+        progress >= Math.max(0, window.startProgress - matchConfig.segmentRepairWindowPadding)
+        && progress <= Math.min(1, window.endProgress + matchConfig.segmentRepairWindowPadding)
+      );
+      return insideRepairWindow ? [{ point, progress }] : [];
+    }),
+  ].sort((a, b) => a.progress - b.progress);
+
+  return samples
+    .filter((sample, index, array) => {
+      const previous = array[index - 1];
+      return !previous
+        || sample.progress - previous.progress > 1 / (matchConfig.segmentRepairExtraPoints * 1.8)
+        || localDistance(sample.point, previous.point) > 1;
+    })
+    .map((sample) => sample.point);
+}
+
 function edgeKey(from: string, to: string) {
   return `${from}->${to}`;
 }
@@ -1907,40 +1989,103 @@ function roadMatchedRoute(graph: RoadGraph, variants: ShapeVariant[], center: La
     .sort((a, b) => a.score - b.score)
     .slice(0, matchConfig.topCandidates);
 
+  type RankedRouteCandidate = {
+    routeDistance: number;
+    score: number;
+    route: GraphNode[];
+    segmentRepairCount: number;
+    segmentWindows: ShapeSegmentWindow[];
+    shapeScore: ShapeScore;
+    targetPoints: Point[];
+    worstSegmentError: number;
+  };
+
+  let segmentRepairsTried = 0;
+
+  function evaluateRouteCandidate(
+    candidate: PlacementCandidate & { score: number; route: GraphNode[] },
+    route: GraphNode[],
+    segmentRepairCount = 0,
+  ): RankedRouteCandidate | null {
+    const stitched = stitchWalkableRoute(
+      graph,
+      route,
+      segmentBudgetMeters * (segmentRepairCount ? matchConfig.segmentRepairBudgetBoost : 1),
+    );
+    if (!stitched) return null;
+
+    const routeDistance = graphDistance(stitched.route);
+    const routeShapePoints = expandRouteGeometry(graph, stitched.route).map((point) => ({ x: point.x, y: point.y }));
+    const scoringRoute = routeShapePoints.length >= 2 ? routeShapePoints : stitched.route;
+    const shapeScore = scoreRouteAgainstShape(scoringRoute, candidate.primaryTargets);
+    const segmentWindows = shapeSegmentWindows(scoringRoute, candidate.primaryTargets);
+    const worstSegmentError = segmentWindows[0]?.score ?? shapeScore.meanError;
+    const severeShortfall = Math.max(0, targetDistanceMeters * matchConfig.minRouteDistanceRatio - routeDistance);
+    const distancePenalty = Math.abs(routeDistance - targetDistanceMeters) * matchConfig.distancePenaltyWeight
+      + severeShortfall * matchConfig.shortRoutePenaltyWeight;
+    const detailPenalty = Math.max(0, stitched.route.length - 420) * 0.45;
+    const skippedPenalty = stitched.skippedWaypoints * matchConfig.skippedWaypointPenalty;
+    const startOffset = Math.hypot(stitched.route[0].x, stitched.route[0].y);
+    const startPenalty = Math.max(0, startOffset - startRangeMeters) * matchConfig.outsideStartPenalty
+      + startOffset * matchConfig.stitchedStartPenalty;
+    const qualityPenalty = routeQualityPenalty(graph, stitched.route).penalty * 0.18;
+    const score = shapeScore.total
+      + candidate.score * matchConfig.rawCandidateScoreWeight
+      + distancePenalty
+      + detailPenalty
+      + skippedPenalty * 0.35
+      + startPenalty
+      + qualityPenalty
+      + segmentRepairCount * matchConfig.segmentRepairPenalty;
+
+    return {
+      routeDistance,
+      score,
+      route: stitched.route,
+      segmentRepairCount,
+      segmentWindows,
+      shapeScore,
+      targetPoints: candidate.primaryTargets,
+      worstSegmentError,
+    };
+  }
+
+  function repairWeakSegments(
+    candidate: PlacementCandidate & { score: number; route: GraphNode[] },
+    base: RankedRouteCandidate,
+  ) {
+    const badWindows = base.segmentWindows
+      .filter((window) => window.score >= matchConfig.segmentRepairMinErrorMeters)
+      .slice(0, matchConfig.segmentRepairWindowLimit);
+    if (!badWindows.length) return [];
+
+    const repairSets = badWindows.map((window) => [window]);
+    if (badWindows.length > 1) repairSets.push(badWindows);
+
+    return repairSets.flatMap((windows) => {
+      const repairTargets = repairTargetsForWindows(candidate.primaryTargets, windows);
+      if (repairTargets.length <= candidate.primaryTargets.length) return [];
+
+      segmentRepairsTried += 1;
+      const matched = graphAwareWaypointRoute(graph, repairTargets);
+      if (!matched) return [];
+
+      const repaired = evaluateRouteCandidate(candidate, matched.route, windows.length);
+      return repaired ? [repaired] : [];
+    });
+  }
+
   const rankedRoutes = rawRanked
-    .map((candidate) => {
-      const stitched = stitchWalkableRoute(graph, candidate.route, segmentBudgetMeters);
-      if (!stitched) return null;
+    .flatMap((candidate, index) => {
+      const base = evaluateRouteCandidate(candidate, candidate.route);
+      if (!base) return [];
+      if (index >= matchConfig.segmentRepairCandidateLimit) return [base];
 
-      const routeDistance = graphDistance(stitched.route);
-      const routeShapePoints = expandRouteGeometry(graph, stitched.route).map((point) => ({ x: point.x, y: point.y }));
-      const shapeScore = scoreRouteAgainstShape(routeShapePoints.length >= 2 ? routeShapePoints : stitched.route, candidate.primaryTargets);
-      const severeShortfall = Math.max(0, targetDistanceMeters * matchConfig.minRouteDistanceRatio - routeDistance);
-      const distancePenalty = Math.abs(routeDistance - targetDistanceMeters) * matchConfig.distancePenaltyWeight
-        + severeShortfall * matchConfig.shortRoutePenaltyWeight;
-      const detailPenalty = Math.max(0, stitched.route.length - 420) * 0.45;
-      const skippedPenalty = stitched.skippedWaypoints * matchConfig.skippedWaypointPenalty;
-      const startOffset = Math.hypot(stitched.route[0].x, stitched.route[0].y);
-      const startPenalty = Math.max(0, startOffset - startRangeMeters) * matchConfig.outsideStartPenalty
-        + startOffset * matchConfig.stitchedStartPenalty;
-      const qualityPenalty = routeQualityPenalty(graph, stitched.route).penalty * 0.18;
-      const score = shapeScore.total
-        + candidate.score * matchConfig.rawCandidateScoreWeight
-        + distancePenalty
-        + detailPenalty
-        + skippedPenalty * 0.35
-        + startPenalty
-        + qualityPenalty;
-
-      return { routeDistance, score, route: stitched.route, shapeScore, targetPoints: candidate.primaryTargets };
+      return [
+        base,
+        ...repairWeakSegments(candidate, base),
+      ];
     })
-    .filter((candidate): candidate is {
-      routeDistance: number;
-      score: number;
-      route: GraphNode[];
-      shapeScore: ShapeScore;
-      targetPoints: Point[];
-    } => Boolean(candidate))
     .sort((a, b) => a.score - b.score);
 
   const chosenCandidate = chooseRouteCandidate(rankedRoutes);
@@ -1969,9 +2114,12 @@ function roadMatchedRoute(graph: RoadGraph, variants: ShapeVariant[], center: La
     points: withPreviewPoints(routeLatLng, center, referencePoints),
     rankedRoutes: rankedRoutes.length,
     selectedRouteRank: chosenCandidate.selectedRank,
+    selectedSegmentRepairs: bestCandidate?.segmentRepairCount ?? 0,
+    segmentRepairsTried,
     shapeErrorMeters: bestCandidate?.shapeScore.meanError,
     startOffsetMeters,
     targetPoints: targetLatLng,
+    worstSegmentErrorMeters: bestCandidate?.worstSegmentError,
   };
 }
 
@@ -2319,6 +2467,9 @@ function App() {
         choicePoolSize: matchedResult.choicePoolSize,
         shapeErrorMeters: matchedResult.shapeErrorMeters,
         anchorErrorMeters: matchedResult.anchorErrorMeters,
+        worstSegmentErrorMeters: matchedResult.worstSegmentErrorMeters,
+        segmentRepairsTried: matchedResult.segmentRepairsTried,
+        selectedSegmentRepairs: matchedResult.selectedSegmentRepairs,
         startOffsetMeters: matchedResult.startOffsetMeters,
       });
       const matchedStats = routeStats(matched);
@@ -2334,10 +2485,13 @@ function App() {
         ? `Start moved ${Math.round(matchedResult.startOffsetMeters)} m from the selected location.`
         : "Start stays near the selected location.";
       const shapeStatus = typeof matchedResult.shapeErrorMeters === "number"
-        ? ` Shape error is about ${Math.round(matchedResult.shapeErrorMeters)} m; key points about ${Math.round(matchedResult.anchorErrorMeters ?? matchedResult.shapeErrorMeters)} m.`
+        ? ` Shape error is about ${Math.round(matchedResult.shapeErrorMeters)} m; key points about ${Math.round(matchedResult.anchorErrorMeters ?? matchedResult.shapeErrorMeters)} m; worst segment about ${Math.round(matchedResult.worstSegmentErrorMeters ?? matchedResult.shapeErrorMeters)} m.`
+        : "";
+      const repairStatus = matchedResult.segmentRepairsTried
+        ? ` Tried ${matchedResult.segmentRepairsTried} weak-segment repairs${matchedResult.selectedSegmentRepairs ? `; selected route uses ${matchedResult.selectedSegmentRepairs}.` : "."}`
         : "";
       setMatchPhase("");
-      setRoadStatus(`${rankingStatus} ${startStatus} GPX distance is ${matchedStats.kilometers.toFixed(2)} km.${shapeStatus}`);
+      setRoadStatus(`${rankingStatus} ${startStatus} GPX distance is ${matchedStats.kilometers.toFixed(2)} km.${shapeStatus}${repairStatus ? ` ${repairStatus}` : ""}`);
     } catch (error) {
       if (requestId !== matchRequestRef.current) return;
       setRoadRoute(null);
@@ -2696,7 +2850,7 @@ function App() {
             {isMatchingRoads
               ? "Calculating path..."
               : matchTiming
-                ? `Last calculation: ${formatMs(matchTiming.totalMs)} total / ${formatMs(matchTiming.roadSearchMs)} road data / ${formatMs(matchTiming.routeMs)} path${typeof matchTiming.rankedRoutes === "number" ? ` / ${matchTiming.rankedRoutes} ranked` : ""}${typeof matchTiming.choicePoolSize === "number" && matchTiming.choicePoolSize > 1 ? ` / picked ${matchTiming.selectedRouteRank ?? 1}/${matchTiming.choicePoolSize}` : ""}${typeof matchTiming.shapeErrorMeters === "number" ? ` / shape ${Math.round(matchTiming.shapeErrorMeters)}m` : ""}${typeof matchTiming.startOffsetMeters === "number" ? ` / start ${Math.round(matchTiming.startOffsetMeters)} m from pin` : ""}`
+                ? `Last calculation: ${formatMs(matchTiming.totalMs)} total / ${formatMs(matchTiming.roadSearchMs)} road data / ${formatMs(matchTiming.routeMs)} path${typeof matchTiming.rankedRoutes === "number" ? ` / ${matchTiming.rankedRoutes} ranked` : ""}${typeof matchTiming.choicePoolSize === "number" && matchTiming.choicePoolSize > 1 ? ` / picked ${matchTiming.selectedRouteRank ?? 1}/${matchTiming.choicePoolSize}` : ""}${typeof matchTiming.shapeErrorMeters === "number" ? ` / shape ${Math.round(matchTiming.shapeErrorMeters)}m` : ""}${typeof matchTiming.worstSegmentErrorMeters === "number" ? ` / worst segment ${Math.round(matchTiming.worstSegmentErrorMeters)}m` : ""}${typeof matchTiming.segmentRepairsTried === "number" && matchTiming.segmentRepairsTried > 0 ? ` / repairs ${matchTiming.segmentRepairsTried}` : ""}${typeof matchTiming.startOffsetMeters === "number" ? ` / start ${Math.round(matchTiming.startOffsetMeters)} m from pin` : ""}`
                 : "Last calculation: not run yet"}
           </p>
           <p className="status timing">
