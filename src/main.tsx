@@ -89,6 +89,19 @@ type TileJson = {
   maxzoom?: number;
 };
 
+type RoutingProvider = "local" | "mapy";
+
+type MapyRouteGeometry =
+  | { type: "Feature"; geometry?: { type: string; coordinates?: number[][] } }
+  | { type: "LineString"; coordinates?: number[][] };
+
+type MapyRouteResponse = {
+  duration?: number;
+  geometry?: MapyRouteGeometry;
+  length?: number;
+  message?: string;
+};
+
 type MatchTiming = {
   totalMs: number;
   roadSearchMs: number;
@@ -254,6 +267,8 @@ const translations = {
       inputsChanged: "Inputs changed. Press Match roads to calculate a walkable route.",
       drawLongerPath: "Draw a longer path shape to match it to streets.",
       checkingCache: "Checking cached road graph, then loading OpenStreetMap only if needed...",
+      mapyRouting: "Planning a walk with Mapy.com routing...",
+      mapyMissingKey: "Mapy.com routing needs VITE_MAPY_API_KEY in .env.local.",
       testing: (placements: number, topCandidates: number) => `Testing ${placements} placements around the selected area and stitching the best ${topCandidates} to roads...`,
       roadDataNoRoute: "Road data loaded, but no connected graph route could be produced.",
       distanceFallback: "Ranked candidates were too short; using a distance-preserving fallback.",
@@ -266,11 +281,13 @@ const translations = {
       shapeError: (shape: number, anchors: number, worst: number) => ` Shape error is about ${shape} m; key points about ${anchors} m; worst segment about ${worst} m.`,
       repairs: (tried: number, selected: number) => ` Tried ${tried} weak-segment repairs${selected ? `; selected route uses ${selected}.` : "."}`,
       result: (ranking: string, start: string, distanceKm: string, shape: string, repairs: string) => `${ranking} ${start} GPX distance is ${distanceKm} km.${shape}${repairs ? ` ${repairs}` : ""}`,
+      mapyResult: (routeType: string, distanceKm: string, shape: string) => `Mapy.com ${routeType} route planned. GPX distance is ${distanceKm} km.${shape}`,
       roadMatchingFailed: "Road matching failed.",
       slowRoadData: "Showing the generated sketch now. Road data is slow, so use Match roads to retry.",
     },
     progress: {
       resolvingStart: "Resolving start point...",
+      mapyRouting: "Planning Mapy.com walking route",
       testingPlacements: (placements: number, meters: number) => `Testing ${placements} shape placements within ${meters} m...`,
       scoringPlacements: "Scoring placements",
       mapMatching: "Map-matching candidates",
@@ -347,6 +364,8 @@ const translations = {
       inputsChanged: "Vstupy se změnily. Pro výpočet pěší trasy stiskni Najít cestu.",
       drawLongerPath: "Nakresli delší tvar, aby šel napasovat na ulice.",
       checkingCache: "Kontroluji uložená data cest, OpenStreetMap načtu jen když bude potřeba...",
+      mapyRouting: "Plánuji pěší trasu přes Mapy.com...",
+      mapyMissingKey: "Plánování přes Mapy.com potřebuje VITE_MAPY_API_KEY v .env.local.",
       testing: (placements: number, topCandidates: number) => `Zkouším ${placements} umístění v okolí a napojuji nejlepších ${topCandidates} na cesty...`,
       roadDataNoRoute: "Data cest jsou načtená, ale nepodařilo se vytvořit propojenou trasu v grafu.",
       distanceFallback: "Seřazené návrhy byly moc krátké; používám záložní trasu s lepší délkou.",
@@ -359,11 +378,13 @@ const translations = {
       shapeError: (shape: number, anchors: number, worst: number) => ` Chyba tvaru je asi ${shape} m; klíčové body asi ${anchors} m; nejhorší segment asi ${worst} m.`,
       repairs: (tried: number, selected: number) => ` Vyzkoušeno ${tried} oprav slabých segmentů${selected ? `; vybraná trasa používá ${selected}.` : "."}`,
       result: (ranking: string, start: string, distanceKm: string, shape: string, repairs: string) => `${ranking} ${start} Délka GPX je ${distanceKm} km.${shape}${repairs ? ` ${repairs}` : ""}`,
+      mapyResult: (routeType: string, distanceKm: string, shape: string) => `Mapy.com naplánovalo trasu ${routeType}. Délka GPX je ${distanceKm} km.${shape}`,
       roadMatchingFailed: "Napojení na cesty selhalo.",
       slowRoadData: "Zatím zobrazuji vygenerovaný náčrt. Data cest jsou pomalá, zkus Najít cestu znovu.",
     },
     progress: {
       resolvingStart: "Určuji výchozí bod...",
+      mapyRouting: "Plánuji pěší trasu přes Mapy.com",
       testingPlacements: (placements: number, meters: number) => `Zkouším ${placements} umístění tvaru do ${meters} m...`,
       scoringPlacements: "Boduji umístění",
       mapMatching: "Napojování kandidátů na mapu",
@@ -449,16 +470,17 @@ const matchConfig = {
   roadNodeSpacingMeters: 20,
   roadTileSizeMeters: 1000,
   roadTileQueryOverlapMeters: 80,
+  mapyRouteWaypointCount: 12,
   maxRenderedSegmentMeters: 10,
   targetPoints: 48,
   topCandidates: 140,
   rawPreselectCandidates: 460,
-  minRoadSearchRadiusMeters: 420,
-  maxRoadSearchRadiusMeters: 2200,
-  roadSearchPaddingMeters: 120,
-  roadSearchStartRadiusShare: 0.3,
+  minRoadSearchRadiusMeters: 500,
+  maxRoadSearchRadiusMeters: 2500,
+  roadSearchPaddingMeters: 160,
+  roadSearchStartRadiusShare: 0.38,
   compactRoadMinSegments: 80,
-  compactRoadRadiusBoost: 1.08,
+  compactRoadRadiusBoost: 1.1,
   startSearchRadiusRatio: 0.18,
   minStartSearchRadiusMeters: 220,
   maxStartSearchRadiusMeters: 1200,
@@ -2651,6 +2673,88 @@ async function roadMatchedRoute(
   };
 }
 
+function activeRoutingProvider(): RoutingProvider {
+  return (import.meta.env.VITE_ROUTING_PROVIDER as string | undefined)?.trim().toLowerCase() === "mapy"
+    ? "mapy"
+    : "local";
+}
+
+function mapyRouteType() {
+  return (import.meta.env.VITE_MAPY_ROUTE_TYPE as string | undefined)?.trim() || "foot_fast";
+}
+
+function mapyCoordinate(point: LatLng) {
+  return `${point.lng.toFixed(7)},${point.lat.toFixed(7)}`;
+}
+
+function mapyGeometryCoordinates(geometry: MapyRouteResponse["geometry"]) {
+  if (!geometry) return null;
+  const line = geometry.type === "Feature" ? geometry.geometry : geometry;
+  if (!line || line.type !== "LineString" || !Array.isArray(line.coordinates)) return null;
+
+  return line.coordinates.filter((coordinate): coordinate is [number, number] => (
+    Array.isArray(coordinate)
+    && coordinate.length >= 2
+    && Number.isFinite(coordinate[0])
+    && Number.isFinite(coordinate[1])
+  ));
+}
+
+async function mapyMatchedRoute(variants: ShapeVariant[], center: LatLng, kilometers: number, language: Language) {
+  const apiKey = (import.meta.env.VITE_MAPY_API_KEY as string | undefined)?.trim();
+  if (!apiKey) throw new Error(translations[language].status.mapyMissingKey);
+
+  const routeType = mapyRouteType();
+  const variant = variants[0];
+  const waypointCount = Math.min(Math.max(Math.round(matchConfig.mapyRouteWaypointCount), 0), 15);
+  const controls = projectToLatLng(resample(variant.points, waypointCount + 2), center, kilometers);
+  if (controls.length < 2) throw new Error(translations[language].status.drawLongerPath);
+
+  const start = controls[0];
+  const end = controls[controls.length - 1];
+  const waypoints = controls.slice(1, -1);
+  const url = new URL("https://api.mapy.com/v1/routing/route");
+  url.searchParams.set("apikey", apiKey);
+  url.searchParams.set("lang", language);
+  url.searchParams.set("start", mapyCoordinate(start));
+  url.searchParams.set("end", mapyCoordinate(end));
+  waypoints.forEach((waypoint) => url.searchParams.append("waypoints", mapyCoordinate(waypoint)));
+  url.searchParams.set("routeType", routeType);
+  url.searchParams.set("format", "geojson");
+
+  const response = await fetch(url.toString(), { mode: "cors" });
+  const json = await response.json().catch(() => null) as MapyRouteResponse | null;
+  if (!response.ok) {
+    throw new Error(json?.message || `Mapy.com route planning failed (${response.status}).`);
+  }
+
+  const coordinates = mapyGeometryCoordinates(json?.geometry);
+  if (!coordinates || coordinates.length < 2) throw new Error("Mapy.com route response did not include route geometry.");
+
+  const points = coordinates.map(([lng, lat]) => {
+    const point = { lat, lng };
+    return { ...point, ...toMeters(point, center) };
+  });
+  const targetLocal = targetMeters(variant.points, kilometers);
+  const routeLocal = points.map((point) => ({ x: point.x, y: point.y }));
+  const shapeScore = scoreRouteAgainstShape(routeLocal, targetLocal);
+  const segmentWindows = shapeSegmentWindows(routeLocal, targetLocal);
+  const worstSegmentError = segmentWindows[0]?.score ?? shapeScore.meanError;
+  const routeDistanceMeters = typeof json?.length === "number" ? json.length : routeStats(points).kilometers * 1000;
+  const targetPoints = projectToLatLng(resample(variant.points, 160), center, kilometers);
+
+  return {
+    anchorErrorMeters: shapeScore.anchorError,
+    controlPoints: controls.length,
+    points,
+    routeDistanceMeters,
+    routeType,
+    shapeErrorMeters: shapeScore.meanError,
+    targetPoints,
+    worstSegmentErrorMeters: worstSegmentError,
+  };
+}
+
 function gpx(points: RoutePoint[], name: string) {
   const safeName = name.replace(/[<>&'"]/g, "");
   const trkpts = points.map((point) =>
@@ -3002,6 +3106,64 @@ function App() {
 
     try {
       const resolvedCenter = selectedLocation ?? await resolveLocation(location);
+      if (activeRoutingProvider() === "mapy") {
+        setMatchPhase(t.progress.mapyRouting);
+        setRoadStatus(t.status.mapyRouting);
+        setGraphInfo(null);
+        setCachedRoadTiles([]);
+        setRoadSegments([]);
+        await waitForPaint();
+
+        const routeStartedAt = performance.now();
+        const matchedResult = await mapyMatchedRoute(sourceVariants, resolvedCenter, distanceKm, language);
+        routeMs = performance.now() - routeStartedAt;
+        if (requestId !== matchRequestRef.current) return;
+
+        const candidate: RouteCandidateOption = {
+          anchorErrorMeters: matchedResult.anchorErrorMeters,
+          points: matchedResult.points,
+          rank: 1,
+          routeDistanceMeters: matchedResult.routeDistanceMeters,
+          score: matchedResult.shapeErrorMeters,
+          segmentRepairCount: 0,
+          shapeErrorMeters: matchedResult.shapeErrorMeters,
+          startOffsetMeters: 0,
+          targetPoints: matchedResult.targetPoints,
+          worstSegmentErrorMeters: matchedResult.worstSegmentErrorMeters,
+        };
+        setRouteCandidates([candidate]);
+        setSelectedCandidateIndex(0);
+        setRoadRoute(matchedResult.points);
+        setTargetRoute(matchedResult.targetPoints);
+        setRoadCenter(resolvedCenter);
+        setHasLoadedOnce(true);
+        setMatchTiming({
+          totalMs: performance.now() - startedAt,
+          roadSearchMs,
+          routeMs,
+          placements: matchedResult.controlPoints,
+          rankedRoutes: 1,
+          selectedRouteRank: 1,
+          choicePoolSize: 1,
+          shapeErrorMeters: matchedResult.shapeErrorMeters,
+          anchorErrorMeters: matchedResult.anchorErrorMeters,
+          worstSegmentErrorMeters: matchedResult.worstSegmentErrorMeters,
+          selectedSegmentRepairs: 0,
+          startOffsetMeters: 0,
+        });
+        const shapeStatus = t.status.shapeError(
+          Math.round(matchedResult.shapeErrorMeters),
+          Math.round(matchedResult.anchorErrorMeters),
+          Math.round(matchedResult.worstSegmentErrorMeters),
+        );
+        setMatchPhase("");
+        setRoadStatus(t.status.mapyResult(
+          matchedResult.routeType,
+          (matchedResult.routeDistanceMeters / 1000).toFixed(2),
+          shapeStatus,
+        ));
+        return;
+      }
       const radius = roadSearchRadiusMeters(sourcePoints, distanceKm, startSearchMeters);
       const roadSearchStartedAt = performance.now();
       const roadFetch = await fetchUsableRoadGraph(resolvedCenter, radius, setMatchPhase, graphPhaseMessages);
