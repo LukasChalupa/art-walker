@@ -2816,11 +2816,47 @@ function compactDrawingPoints(points: Point[], minDistance = 4) {
   }, []);
 }
 
-function drawingToPath(points: Point[]) {
-  const compacted = compactDrawingPoints(points, 5);
-  if (compacted.length < 4) return null;
+function mergeDrawingStrokes(strokes: Point[][]) {
+  const remaining = strokes
+    .map((stroke) => compactDrawingPoints(stroke, 5))
+    .filter((stroke) => stroke.length >= 2);
+  if (!remaining.length) return [];
 
-  return normalize(compacted.map((point) => ({
+  let merged = [...remaining.shift()!];
+  while (remaining.length) {
+    const first = merged[0];
+    const last = merged[merged.length - 1];
+    let best = { distance: Number.POSITIVE_INFINITY, index: 0, mode: "append" as "append" | "appendReverse" | "prepend" | "prependReverse" };
+
+    remaining.forEach((stroke, index) => {
+      const strokeFirst = stroke[0];
+      const strokeLast = stroke[stroke.length - 1];
+      const options = [
+        { distance: Math.hypot(last.x - strokeFirst.x, last.y - strokeFirst.y), mode: "append" as const },
+        { distance: Math.hypot(last.x - strokeLast.x, last.y - strokeLast.y), mode: "appendReverse" as const },
+        { distance: Math.hypot(first.x - strokeLast.x, first.y - strokeLast.y), mode: "prepend" as const },
+        { distance: Math.hypot(first.x - strokeFirst.x, first.y - strokeFirst.y), mode: "prependReverse" as const },
+      ];
+      options.forEach((option) => {
+        if (option.distance < best.distance) best = { ...option, index };
+      });
+    });
+
+    const [stroke] = remaining.splice(best.index, 1);
+    if (best.mode === "append") merged = [...merged, ...stroke];
+    if (best.mode === "appendReverse") merged = [...merged, ...stroke.slice().reverse()];
+    if (best.mode === "prepend") merged = [...stroke, ...merged];
+    if (best.mode === "prependReverse") merged = [...stroke.slice().reverse(), ...merged];
+  }
+
+  return merged;
+}
+
+function drawingToPath(strokes: Point[][]) {
+  const merged = mergeDrawingStrokes(strokes);
+  if (merged.length < 4) return null;
+
+  return normalize(merged.map((point) => ({
     x: point.x - drawingCanvasWidth / 2,
     y: point.y - drawingCanvasHeight / 2,
   })));
@@ -2877,6 +2913,7 @@ function App() {
   const [isLocationFocused, setIsLocationFocused] = useState(false);
   const [distanceKm, setDistanceKm] = useState(5);
   const [drawnPath, setDrawnPath] = useState<Point[] | null>(null);
+  const [drawingStrokes, setDrawingStrokes] = useState<Point[][]>([]);
   const [drawingPoints, setDrawingPoints] = useState<Point[]>([]);
   const [isDrawingShape, setIsDrawingShape] = useState(false);
   const [roadRoute, setRoadRoute] = useState<RoutePoint[] | null>(null);
@@ -2894,6 +2931,7 @@ function App() {
   const [graphInfo, setGraphInfo] = useState<GraphInfo | null>(null);
   const [hasLoadedOnce, setHasLoadedOnce] = useState(false);
   const drawingCanvasRef = useRef<HTMLCanvasElement>(null);
+  const drawingStrokesRef = useRef<Point[][]>([]);
   const drawingPointsRef = useRef<Point[]>([]);
   const mapElementRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<L.Map | null>(null);
@@ -2990,7 +3028,13 @@ function App() {
     setDrawingPoints(points);
   }
 
+  function setFinishedDrawingStrokes(strokes: Point[][]) {
+    drawingStrokesRef.current = strokes;
+    setDrawingStrokes(strokes);
+  }
+
   function resetDrawing() {
+    setFinishedDrawingStrokes([]);
     setDrawingStroke([]);
     setDrawnPath(null);
   }
@@ -3025,7 +3069,13 @@ function App() {
   function finishDrawing() {
     if (!isDrawingShape) return;
     setIsDrawingShape(false);
-    const path = drawingToPath(drawingPointsRef.current);
+    const stroke = compactDrawingPoints(drawingPointsRef.current, 5);
+    const nextStrokes = stroke.length >= 2
+      ? [...drawingStrokesRef.current, stroke]
+      : drawingStrokesRef.current;
+    setFinishedDrawingStrokes(nextStrokes);
+    setDrawingStroke([]);
+    const path = drawingToPath(nextStrokes);
     setDrawnPath(path);
     if (!path) {
       setRoadStatus(t.status.drawLongerPath);
@@ -3080,17 +3130,18 @@ function App() {
       context.stroke();
     }
 
-    if (drawingPoints.length < 2) return;
+    const previewPath = mergeDrawingStrokes([...drawingStrokes, drawingPoints]);
+    if (previewPath.length < 2) return;
 
     context.strokeStyle = "#fc4c02";
     context.lineWidth = 7;
     context.lineCap = "round";
     context.lineJoin = "round";
     context.beginPath();
-    context.moveTo(drawingPoints[0].x, drawingPoints[0].y);
-    drawingPoints.slice(1).forEach((point) => context.lineTo(point.x, point.y));
+    context.moveTo(previewPath[0].x, previewPath[0].y);
+    previewPath.slice(1).forEach((point) => context.lineTo(point.x, point.y));
     context.stroke();
-  }, [drawingPoints]);
+  }, [drawingStrokes, drawingPoints]);
 
   async function handleMatchRoads() {
     const requestId = matchRequestRef.current + 1;
@@ -3555,7 +3606,7 @@ function App() {
           <div className="drawingPad">
             <div className="drawingHeader">
               <span>{t.drawPath}</span>
-              <button type="button" onClick={handleDrawingClear} disabled={!drawingPoints.length && !drawnPath}>
+              <button type="button" onClick={handleDrawingClear} disabled={!drawingStrokes.length && !drawingPoints.length && !drawnPath}>
                 {t.clear}
               </button>
             </div>
