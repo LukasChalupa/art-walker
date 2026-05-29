@@ -61,6 +61,8 @@ type RoadTileArea = {
   y: number;
 };
 
+type RoadTileAreaProgress = (tiles: RoadTileArea[]) => void;
+
 type CachedRoadGraph = {
   nodes: GraphNode[];
   edges: Array<[string, GraphEdge[]]>;
@@ -140,6 +142,8 @@ type ShapeVariant = {
   name: string;
   points: Point[];
   penalty: number;
+  description?: string;
+  aiGeneratedSketch?: boolean;
 };
 
 type PlacementCandidate = {
@@ -148,6 +152,9 @@ type PlacementCandidate = {
   startDrift: number;
   shapePenalty: number;
   rotationPenalty: number;
+  variantName?: string;
+  variantDescription?: string;
+  variantIsAi?: boolean;
 };
 
 type ShapeScore = {
@@ -167,6 +174,13 @@ type ShapeSegmentWindow = {
 };
 
 type RouteCandidateOption = {
+  aiConfidence?: number;
+  aiGeneratedSketch?: boolean;
+  aiDescription?: string;
+  aiLabel?: string;
+  aiMatchesTarget?: boolean;
+  aiReason?: string;
+  aiTargetConfidence?: number;
   anchorErrorMeters: number;
   points: RoutePoint[];
   rank: number;
@@ -177,6 +191,30 @@ type RouteCandidateOption = {
   startOffsetMeters: number;
   targetPoints: RoutePoint[];
   worstSegmentErrorMeters: number;
+};
+
+type AiShapeCandidate = RouteCandidateOption & {
+  backtrackRatio: number;
+  localShapeScore: number;
+  reuseRatio: number;
+  uniqueNodeRatio: number;
+};
+
+type AiShapeRecognition = {
+  confidence?: number;
+  description?: string;
+  id: number;
+  label?: string;
+  matchesTarget?: boolean;
+  reason?: string;
+  targetConfidence?: number;
+};
+
+type AiVectorSketch = {
+  label: string;
+  description: string;
+  closed: boolean;
+  strokes: Point[][];
 };
 
 type ObstaclePolygon = {
@@ -213,6 +251,7 @@ type MatchProgressLabels = {
 
 
 type Language = "en" | "cs";
+type ShapeInputMode = "draw" | "ai";
 
 const translations = {
   en: {
@@ -227,12 +266,23 @@ const translations = {
     locationSuggestions: "Location suggestions",
     searchingAddresses: "Searching addresses...",
     approximateDistance: "Approximate walking distance",
+    shapeInputTabs: {
+      draw: "Shape + draw",
+      ai: "Text + AI",
+    },
+    aiShapeSearch: "AI shape search",
+    aiShapeSearchPlaceholder: "cat, flower, bicycle, dragon, musical note...",
+    aiSuggestedShapes: "AI suggested shapes",
     shapePresets: "Shape presets",
     useShape: (name: string) => `Use ${name} shape`,
     matchRoads: "Match roads",
     matchingRoads: "Matching roads...",
     exportGpx: "Export walkable GPX",
+    findAiShapes: (query: string) => query ? "Generate & match " + query : "Generate & match AI shapes",
+    findingAiShapes: (query: string) => query ? "Matching " + query + " sketches..." : "Matching AI sketches...",
     bestRoutes: "Best routes",
+    aiShapeDescription: (label: string, confidence: number, description: string) => "AI sees this route as " + label + " with " + confidence + "% confidence. " + description,
+    aiSketchDescription: (label: string, description: string) => "AI sketch: " + label + ". " + description,
     shapeShort: "shape",
     worstShort: "worst",
     route: "Route",
@@ -269,6 +319,14 @@ const translations = {
       checkingCache: "Checking cached road graph, then loading OpenStreetMap only if needed...",
       mapyRouting: "Planning a walk with Mapy.com routing...",
       mapyMissingKey: "Mapy.com routing needs VITE_MAPY_API_KEY in .env.local.",
+      aiLoadingGraph: "Loading road data before matching AI sketches...",
+      aiSketching: (query: string) => query ? "Asking AI for " + query + " vector sketches..." : "Asking AI for vector sketches...",
+      aiSketchNoShapes: "AI did not return usable vector sketches.",
+      aiSketchMatched: (count: number, query: string, result: string) => `Generated ${count} ${query || "AI"} sketches and matched them to roads. ${result}`,
+      aiGenerating: (query: string) => query ? "Generating walkable candidates for " + query + "..." : "Generating possible map shapes from walkable roads...",
+      aiRanking: (query: string) => query ? "Asking AI which routes best match " + query + "..." : "Asking AI to recognize the strongest shapes...",
+      aiFound: (count: number, query: string) => query ? `Found ${count} walkable candidates ranked for ${query}.` : `Found ${count} walkable shape candidates.`,
+      aiLocalFallback: (count: number, query: string) => query ? `Found ${count} local candidates, but AI ranking for ${query} is unavailable.` : `Found ${count} local shape candidates. AI ranking is unavailable, so these are sorted by geometry only.`,
       testing: (placements: number, topCandidates: number) => `Testing ${placements} placements around the selected area and stitching the best ${topCandidates} to roads...`,
       roadDataNoRoute: "Road data loaded, but no connected graph route could be produced.",
       distanceFallback: "Ranked candidates were too short; using a distance-preserving fallback.",
@@ -293,6 +351,9 @@ const translations = {
       mapMatching: "Map-matching candidates",
       stitching: "Stitching and repairing candidates",
       choosingBest: "Choosing best route",
+      aiSketching: (query: string) => query ? "AI sketching " + query : "AI sketching shapes",
+      aiGenerating: (query: string) => query ? "Generating " + query + " candidates" : "Generating shape candidates",
+      aiRanking: (query: string) => query ? "AI ranking " + query + " matches" : "AI recognizing shapes",
     },
     graph: {
       usingCached: (profile: string, radius: number) => `Using cached ${profile} within ${radius} m...`,
@@ -324,12 +385,23 @@ const translations = {
     locationSuggestions: "Návrhy míst",
     searchingAddresses: "Hledám adresy...",
     approximateDistance: "Přibližná délka chůze",
+    shapeInputTabs: {
+      draw: "Tvar + kresba",
+      ai: "Text + AI",
+    },
+    aiShapeSearch: "Co má AI hledat",
+    aiShapeSearchPlaceholder: "kočka, květina, kolo, drak, nota...",
+    aiSuggestedShapes: "Tvary navržené AI",
     shapePresets: "Přednastavené tvary",
     useShape: (name: string) => `Použít tvar ${name}`,
     matchRoads: "Najít cestu",
     matchingRoads: "Hledám cestu...",
     exportGpx: "Exportovat GPX",
+    findAiShapes: (query: string) => query ? "Vygenerovat a napasovat " + query : "Vygenerovat AI tvary",
+    findingAiShapes: (query: string) => query ? "Napasovávám náčrty pro " + query + "..." : "Napasovávám AI náčrty...",
     bestRoutes: "Nejlepší trasy",
+    aiShapeDescription: (label: string, confidence: number, description: string) => "AI v této trase vidí " + label + " s jistotou " + confidence + " %. " + description,
+    aiSketchDescription: (label: string, description: string) => "AI náčrt: " + label + ". " + description,
     shapeShort: "tvar",
     worstShort: "nejhorší",
     route: "Trasa",
@@ -366,6 +438,14 @@ const translations = {
       checkingCache: "Kontroluji uložená data cest, OpenStreetMap načtu jen když bude potřeba...",
       mapyRouting: "Plánuji pěší trasu přes Mapy.com...",
       mapyMissingKey: "Plánování přes Mapy.com potřebuje VITE_MAPY_API_KEY v .env.local.",
+      aiLoadingGraph: "Načítám data cest pro napasování AI náčrtů...",
+      aiSketching: (query: string) => query ? "AI generuje vektorové náčrty pro " + query + "..." : "AI generuje vektorové náčrty...",
+      aiSketchNoShapes: "AI nevrátila použitelné vektorové náčrty.",
+      aiSketchMatched: (count: number, query: string, result: string) => `Vygenerováno ${count} náčrtů pro ${query || "AI tvar"} a napasováno na cesty. ${result}`,
+      aiGenerating: (query: string) => query ? "Generuji pěší kandidáty pro " + query + "..." : "Generuji možné tvary z pěších cest...",
+      aiRanking: (query: string) => query ? "AI vybírá trasy nejpodobnější " + query + "..." : "AI rozpoznává nejsilnější tvary...",
+      aiFound: (count: number, query: string) => query ? `Nalezeno ${count} pěších kandidátů seřazených pro ${query}.` : `Nalezeno ${count} pěších kandidátů tvarů.`,
+      aiLocalFallback: (count: number, query: string) => query ? `Nalezeno ${count} lokálních kandidátů, ale AI řazení pro ${query} není dostupné.` : `Nalezeno ${count} lokálních kandidátů. AI řazení není dostupné, takže jsou seřazeni jen podle geometrie.`,
       testing: (placements: number, topCandidates: number) => `Zkouším ${placements} umístění v okolí a napojuji nejlepších ${topCandidates} na cesty...`,
       roadDataNoRoute: "Data cest jsou načtená, ale nepodařilo se vytvořit propojenou trasu v grafu.",
       distanceFallback: "Seřazené návrhy byly moc krátké; používám záložní trasu s lepší délkou.",
@@ -390,6 +470,9 @@ const translations = {
       mapMatching: "Napojování kandidátů na mapu",
       stitching: "Propojuji a opravuji kandidáty",
       choosingBest: "Vybírám nejlepší trasu",
+      aiSketching: (query: string) => query ? "AI kreslí " + query : "AI kreslí tvary",
+      aiGenerating: (query: string) => query ? "Generuji kandidáty pro " + query : "Generuji kandidáty tvarů",
+      aiRanking: (query: string) => query ? "AI řadí shody pro " + query : "AI rozpoznává tvary",
     },
     graph: {
       usingCached: (profile: string, radius: number) => `Používám data z paměti: ${profile} do ${radius} m...`,
@@ -417,10 +500,16 @@ const languageOptions: Array<{ id: Language; label: string }> = [
 ];
 
 const savedLanguageKey = "route-canvas.language";
+const savedAiShapeQueryKey = "route-canvas.ai-shape-query";
 
 function loadSavedLanguage(): Language {
   if (typeof window === "undefined") return "cs";
   return window.localStorage.getItem(savedLanguageKey) === "en" ? "en" : "cs";
+}
+
+function loadSavedAiShapeQuery() {
+  if (typeof window === "undefined") return "";
+  return window.localStorage.getItem(savedAiShapeQueryKey) ?? "";
 }
 
 const locationPresets: Record<string, LatLng> = {
@@ -471,14 +560,38 @@ const matchConfig = {
   roadTileSizeMeters: 1000,
   roadTileQueryOverlapMeters: 80,
   mapyRouteWaypointCount: 12,
+  aiShapeCandidateCount: 24,
+  aiShapeAttempts: 560,
+  aiShapeMaxRequestCandidates: 24,
+  aiShapeTargetConfidenceMin: 0.68,
+  aiVectorShapeLimit: 8,
+  aiVectorShapeVariantPenalty: 180,
+  aiVectorReversePenalty: 90,
+  aiShapeWalkOvershootRatio: 1.12,
+  aiShapeBacktrackRatioPenalty: 520,
+  aiShapeUndirectedReusePenalty: 540,
+  aiShapeRepeatedDirectedPenalty: 380,
+  aiShapeImmediateBacktrackPenalty: 620,
+  aiShapeLowUniquePenalty: 240,
+  aiShapeQualityPenaltyWeight: 0.035,
+  aiShapeRepeatPenaltyScale: 2.2,
+  aiShapeReversePenaltyScale: 2.8,
+  aiShapeDeadEndPenaltyScale: 1.4,
+  aiShapeImmediateBacktrackScale: 2.6,
+  aiShapeUndirectedReuseStepPenalty: 180,
+  aiShapeExtremeBacktrackRatio: 0.18,
+  aiShapeMaxReverseEdgeRatio: 0.1,
+  aiShapeMaxUndirectedReuseRatio: 0.18,
+  aiShapeMaxImmediateBacktrackRatio: 0.06,
+  aiShapeMinUniqueNodeRatio: 0.72,
   maxRenderedSegmentMeters: 10,
   targetPoints: 48,
   topCandidates: 140,
   rawPreselectCandidates: 460,
-  minRoadSearchRadiusMeters: 500,
-  maxRoadSearchRadiusMeters: 2500,
-  roadSearchPaddingMeters: 160,
-  roadSearchStartRadiusShare: 0.38,
+  minRoadSearchRadiusMeters: 600,
+  maxRoadSearchRadiusMeters: 3000,
+  roadSearchPaddingMeters: 200,
+  roadSearchStartRadiusShare: 0.7,
   compactRoadMinSegments: 80,
   compactRoadRadiusBoost: 1.1,
   startSearchRadiusRatio: 0.18,
@@ -997,6 +1110,97 @@ function shapeVariants(description: string, customPath: Point[] | null): ShapeVa
   return customPath?.length ? customShapeVariants(customPath) : textShapeVariants(description);
 }
 
+function routePlacementTryCount(variantCount: number, startSearchMeters: number) {
+  return variantCount * (
+    matchConfig.scales.length
+    * matchConfig.rotations.length
+    * startAnchors(startSearchMeters).length
+    + matchConfig.randomCandidatesPerVariant
+  );
+}
+
+function mergeShapeStrokes(strokes: Point[][]) {
+  const remaining = strokes
+    .map((stroke) => stroke.filter((point) => Number.isFinite(point.x) && Number.isFinite(point.y)))
+    .filter((stroke) => stroke.length >= 2);
+  if (!remaining.length) return [];
+
+  let merged = [...remaining.shift()!];
+  while (remaining.length) {
+    const first = merged[0];
+    const last = merged[merged.length - 1];
+    let best = { distance: Number.POSITIVE_INFINITY, index: 0, mode: "append" as "append" | "appendReverse" | "prepend" | "prependReverse" };
+
+    remaining.forEach((stroke, index) => {
+      const strokeFirst = stroke[0];
+      const strokeLast = stroke[stroke.length - 1];
+      const options = [
+        { distance: Math.hypot(last.x - strokeFirst.x, last.y - strokeFirst.y), mode: "append" as const },
+        { distance: Math.hypot(last.x - strokeLast.x, last.y - strokeLast.y), mode: "appendReverse" as const },
+        { distance: Math.hypot(first.x - strokeLast.x, first.y - strokeLast.y), mode: "prepend" as const },
+        { distance: Math.hypot(first.x - strokeFirst.x, first.y - strokeFirst.y), mode: "prependReverse" as const },
+      ];
+      options.forEach((option) => {
+        if (option.distance < best.distance) best = { ...option, index };
+      });
+    });
+
+    const [stroke] = remaining.splice(best.index, 1);
+    if (best.mode === "append") merged = [...merged, ...stroke];
+    if (best.mode === "appendReverse") merged = [...merged, ...stroke.slice().reverse()];
+    if (best.mode === "prepend") merged = [...stroke, ...merged];
+    if (best.mode === "prependReverse") merged = [...stroke.slice().reverse(), ...merged];
+  }
+
+  return merged;
+}
+
+function aiVectorSketchPath(sketch: AiVectorSketch) {
+  const strokes = sketch.strokes
+    .map((stroke) => {
+      const points = stroke.filter((point) => Number.isFinite(point.x) && Number.isFinite(point.y));
+      if (sketch.closed && points.length >= 3) {
+        const first = points[0];
+        const last = points[points.length - 1];
+        if (Math.hypot(first.x - last.x, first.y - last.y) > 0.001) {
+          return [...points, first];
+        }
+      }
+      return points;
+    })
+    .filter((stroke) => stroke.length >= 2);
+  const merged = mergeShapeStrokes(strokes);
+  if (merged.length < 4) return null;
+
+  return normalize(merged);
+}
+
+function aiVectorSketchVariants(sketches: AiVectorSketch[]) {
+  const variants: ShapeVariant[] = [];
+  sketches.slice(0, matchConfig.aiVectorShapeLimit).forEach((sketch, index) => {
+    const points = aiVectorSketchPath(sketch);
+    if (!points) return;
+
+    const penalty = index * matchConfig.aiVectorShapeVariantPenalty;
+    variants.push({
+      aiGeneratedSketch: true,
+      description: sketch.description,
+      name: sketch.label,
+      penalty,
+      points,
+    });
+    variants.push({
+      aiGeneratedSketch: true,
+      description: sketch.description,
+      name: sketch.label,
+      penalty: penalty + matchConfig.aiVectorReversePenalty,
+      points: [...points].reverse(),
+    });
+  });
+
+  return variants;
+}
+
 function randomStartAnchor(startRangeMeters: number) {
   const angle = Math.random() * Math.PI * 2;
   const radius = Math.sqrt(Math.random()) * startRangeMeters;
@@ -1158,7 +1362,7 @@ function roadTileForPoint(point: LatLng) {
 }
 
 function roadTileArea(tile: RoadTile, source: RoadTileLoadSource): RoadTileArea {
-  const bounds = roadTileFromCoords(tile.x, tile.y, 0);
+  const bounds = roadTileFromCoords(tile.x, tile.y, matchConfig.roadTileQueryOverlapMeters);
   return {
     east: bounds.east,
     north: bounds.north,
@@ -1513,6 +1717,7 @@ async function fetchRoadGraph(
   profile: RoadQueryProfile,
   onPhase?: (message: string) => void,
   messages?: RoadGraphPhaseMessages,
+  onTileAreas?: RoadTileAreaProgress,
 ): Promise<{ failedTiles: number; graph: RoadGraph; radiusMeters: number; source: RoadGraphSource; tileCount: number; tiles: RoadTileArea[] }> {
   const radiusBucket = Math.round(radiusMeters / 100) * 100;
   const tiles = roadTilesForRadius(center, radiusBucket);
@@ -1524,6 +1729,7 @@ async function fetchRoadGraph(
 
   onPhase?.(messages?.loadingOsm(profile, Math.round(radiusBucket)) ?? `Loading ${profile.label} within ${Math.round(radiusBucket)} m from OpenStreetMap...`);
   onPhase?.(messages?.tileProgress(profile, 0, tiles.length, 0, 0, 0) ?? `Road tiles 0/${tiles.length} for ${profile.label}...`);
+  onTileAreas?.([]);
 
   for (const [index, tile] of tiles.entries()) {
     try {
@@ -1537,6 +1743,7 @@ async function fetchRoadGraph(
       tileAreas.push(roadTileArea(tile, "failed"));
     }
 
+    onTileAreas?.([...tileAreas]);
     const cached = sourceCounts.memory + sourceCounts.persistent;
     onPhase?.(
       messages?.tileProgress(profile, index + 1, tiles.length, cached, sourceCounts.network, failedTiles)
@@ -1572,13 +1779,14 @@ async function fetchUsableRoadGraph(
   radiusMeters: number,
   onPhase: (message: string) => void,
   messages?: RoadGraphPhaseMessages,
+  onTileAreas?: RoadTileAreaProgress,
 ) {
   const compactProfile = roadQueryProfiles.compact;
   const broadProfile = roadQueryProfiles.broad;
   let compactResult: Awaited<ReturnType<typeof fetchRoadGraph>> | null = null;
 
   try {
-    const result = await fetchRoadGraph(center, radiusMeters, compactProfile, onPhase, messages);
+    const result = await fetchRoadGraph(center, radiusMeters, compactProfile, onPhase, messages, onTileAreas);
     compactResult = result;
     if (result.graph.segments.length >= matchConfig.compactRoadMinSegments) {
       return { ...result, profile: compactProfile };
@@ -1589,7 +1797,7 @@ async function fetchUsableRoadGraph(
 
   const broadRadius = Math.min(radiusMeters * matchConfig.compactRoadRadiusBoost, matchConfig.maxRoadSearchRadiusMeters);
   try {
-    const result = await fetchRoadGraph(center, broadRadius, broadProfile, onPhase, messages);
+    const result = await fetchRoadGraph(center, broadRadius, broadProfile, onPhase, messages, onTileAreas);
     return { ...result, profile: broadProfile };
   } catch (error) {
     if (compactResult) return { ...compactResult, profile: compactProfile };
@@ -2351,6 +2559,716 @@ function fallbackWalkableRoute(graph: RoadGraph, center: LatLng, kilometers: num
   return deduped;
 }
 
+
+function routeBacktrackRatio(route: GraphNode[]) {
+  return routeReuseStats(route).reverseEdgeRatio;
+}
+
+function undirectedEdgeKey(from: string, to: string) {
+  return from < to ? from + '<->' + to : to + '<->' + from;
+}
+
+function routeReuseStats(route: GraphNode[]) {
+  const edgeCount = Math.max(route.length - 1, 1);
+  const directedEdges = new Set<string>();
+  const undirectedEdges = new Set<string>();
+  let immediateBacktracks = 0;
+  let repeatedDirected = 0;
+  let repeatedUndirected = 0;
+  let reverseVisits = 0;
+
+  for (let index = 1; index < route.length; index += 1) {
+    const prev = route[index - 1];
+    const current = route[index];
+    const forward = edgeKey(prev.id, current.id);
+    const reverse = edgeKey(current.id, prev.id);
+    const undirected = undirectedEdgeKey(prev.id, current.id);
+
+    if (directedEdges.has(forward)) repeatedDirected += 1;
+    if (directedEdges.has(reverse)) reverseVisits += 1;
+    if (undirectedEdges.has(undirected)) repeatedUndirected += 1;
+    if (index >= 2 && current.id === route[index - 2].id) immediateBacktracks += 1;
+
+    directedEdges.add(forward);
+    undirectedEdges.add(undirected);
+  }
+
+  return {
+    immediateBacktrackRatio: immediateBacktracks / edgeCount,
+    repeatedDirectedRatio: repeatedDirected / edgeCount,
+    reverseEdgeRatio: reverseVisits / edgeCount,
+    undirectedReuseRatio: repeatedUndirected / edgeCount,
+    uniqueNodeRatio: new Set(route.map((node) => node.id)).size / Math.max(route.length, 1),
+  };
+}
+
+function routeTurnScore(points: Point[]) {
+  if (points.length < 3) return 0;
+
+  let total = 0;
+  for (let index = 1; index < points.length - 1; index += 1) {
+    const prev = points[index - 1];
+    const current = points[index];
+    const next = points[index + 1];
+    const incoming = Math.atan2(current.y - prev.y, current.x - prev.x);
+    const outgoing = Math.atan2(next.y - current.y, next.x - current.x);
+    total += Math.abs(Math.atan2(Math.sin(outgoing - incoming), Math.cos(outgoing - incoming)));
+  }
+
+  return total;
+}
+
+function polylineArea(points: Point[]) {
+  if (points.length < 3) return 0;
+
+  let area = 0;
+  points.forEach((point, index) => {
+    const next = points[(index + 1) % points.length];
+    area += point.x * next.y - next.x * point.y;
+  });
+
+  return Math.abs(area) / 2;
+}
+
+function localShapeCandidateScore(graph: RoadGraph, route: GraphNode[], routePoints: Point[], targetDistanceMeters: number) {
+  if (routePoints.length < 4) return Number.POSITIVE_INFINITY;
+
+  const routeDistance = graphDistance(route);
+  const bounds = boundsOf(routePoints);
+  const width = Math.max(bounds.maxX - bounds.minX, 1);
+  const height = Math.max(bounds.maxY - bounds.minY, 1);
+  const diagonal = Math.hypot(width, height);
+  const closure = localDistance(routePoints[0], routePoints[routePoints.length - 1]);
+  const area = polylineArea(routePoints);
+  const turnScore = routeTurnScore(resample(routePoints, 52));
+  const reuseStats = routeReuseStats(route);
+  const qualityPenalty = routeQualityPenalty(graph, route).penalty;
+  const distanceError = Math.abs(routeDistance - targetDistanceMeters) / Math.max(targetDistanceMeters, 1);
+  const compactness = routeDistance / Math.max(diagonal, 1);
+  const areaRatio = area / Math.max(width * height, 1);
+  const closureRatio = closure / Math.max(diagonal, 1);
+
+  return distanceError * 90
+    + reuseStats.reverseEdgeRatio * matchConfig.aiShapeBacktrackRatioPenalty
+    + reuseStats.undirectedReuseRatio * matchConfig.aiShapeUndirectedReusePenalty
+    + reuseStats.repeatedDirectedRatio * matchConfig.aiShapeRepeatedDirectedPenalty
+    + reuseStats.immediateBacktrackRatio * matchConfig.aiShapeImmediateBacktrackPenalty
+    + Math.max(0, matchConfig.aiShapeMinUniqueNodeRatio - reuseStats.uniqueNodeRatio) * matchConfig.aiShapeLowUniquePenalty
+    + qualityPenalty * matchConfig.aiShapeQualityPenaltyWeight
+    + Math.abs(compactness - 4.6) * 6
+    + closureRatio * 10
+    - Math.min(turnScore, 22) * 2.4
+    - Math.min(areaRatio, 0.62) * 34;
+}
+
+function randomWalkCandidate(graph: RoadGraph, targetDistanceMeters: number) {
+  const starts = graph.nodeGrid.nodes.filter((node) => (graph.edges.get(node.id) ?? []).length >= 2);
+  if (!starts.length) return null;
+
+  const start = starts[Math.floor(Math.random() * starts.length)];
+  const route: GraphNode[] = [start];
+  const edgeVisits = new Map<string, number>();
+  const undirectedVisits = new Map<string, number>();
+  const mode = Math.random();
+  let current = start;
+  let previous: GraphNode | null = null;
+  let meters = 0;
+
+  for (let step = 0; step < 900 && meters < targetDistanceMeters * matchConfig.aiShapeWalkOvershootRatio; step += 1) {
+    const edges = (graph.edges.get(current.id) ?? [])
+      .flatMap((edge) => {
+        const next = graph.nodes.get(edge.to);
+        return next ? [{ edge, next }] : [];
+      });
+    if (!edges.length) break;
+
+    const progress = meters / Math.max(targetDistanceMeters, 1);
+    const currentAngle = Math.atan2(current.y - start.y, current.x - start.x);
+    const loopHeading = currentAngle + Math.PI / 2 + (mode > 0.5 ? 0.45 : -0.45);
+    const waveHeading = previous
+      ? Math.atan2(current.y - previous.y, current.x - previous.x) + Math.sin(progress * Math.PI * 6 + mode * Math.PI) * 1.15
+      : loopHeading;
+    const preferredHeading = mode < 0.55 ? loopHeading : waveHeading;
+
+    const freshEdges = edges.filter(({ next }) => {
+      const forwardVisits = edgeVisits.get(edgeKey(current.id, next.id)) ?? 0;
+      const reverseVisits = edgeVisits.get(edgeKey(next.id, current.id)) ?? 0;
+      const immediateBacktrack = Boolean(previous && next.id === previous.id);
+      return !forwardVisits && !reverseVisits && !immediateBacktrack;
+    });
+    const selectableEdges = freshEdges.length ? freshEdges : edges;
+    if (!freshEdges.length && meters > targetDistanceMeters * 0.28) break;
+
+    const ranked = selectableEdges
+      .map(({ edge, next }) => {
+        const forwardKey = edgeKey(current.id, next.id);
+        const reverseKey = edgeKey(next.id, current.id);
+        const undirectedKey = undirectedEdgeKey(current.id, next.id);
+        const heading = Math.atan2(next.y - current.y, next.x - current.x);
+        const headingPenalty = Math.abs(Math.atan2(Math.sin(heading - preferredHeading), Math.cos(heading - preferredHeading))) * 9;
+        const repeatPenalty = (edgeVisits.get(forwardKey) ?? 0) * matchConfig.repeatedEdgePenalty * matchConfig.aiShapeRepeatPenaltyScale;
+        const reversePenalty = (edgeVisits.get(reverseKey) ?? 0) * matchConfig.reverseEdgePenalty * matchConfig.aiShapeReversePenaltyScale;
+        const deadEndPenalty = isDeadEndNode(graph, next.id)
+          ? matchConfig.deadEndPenalty * matchConfig.aiShapeDeadEndPenaltyScale
+          : 0;
+        const previousPenalty = previous && next.id === previous.id
+          ? matchConfig.reverseEdgePenalty * matchConfig.aiShapeImmediateBacktrackScale
+          : 0;
+        const undirectedReusePenalty = (undirectedVisits.get(undirectedKey) ?? 0) * matchConfig.aiShapeUndirectedReuseStepPenalty;
+        const closurePenalty = progress > 0.62 ? localDistance(next, start) * 0.012 : 0;
+        const overshootPenalty = Math.max(0, meters + edge.weight - targetDistanceMeters * matchConfig.aiShapeWalkOvershootRatio) * 0.2;
+        return {
+          edge,
+          next,
+          score: headingPenalty + repeatPenalty + reversePenalty + undirectedReusePenalty + deadEndPenalty + previousPenalty + closurePenalty + overshootPenalty + Math.random() * 7,
+        };
+      })
+      .sort((a, b) => a.score - b.score)
+      .slice(0, 4);
+
+    const picked = ranked[Math.min(ranked.length - 1, Math.floor(Math.random() * Math.min(2, ranked.length)))];
+    if (!picked) break;
+
+    const pickedEdgeKey = edgeKey(current.id, picked.next.id);
+    const pickedUndirectedKey = undirectedEdgeKey(current.id, picked.next.id);
+    edgeVisits.set(pickedEdgeKey, (edgeVisits.get(pickedEdgeKey) ?? 0) + 1);
+    undirectedVisits.set(pickedUndirectedKey, (undirectedVisits.get(pickedUndirectedKey) ?? 0) + 1);
+    previous = current;
+    current = picked.next;
+    meters += picked.edge.weight;
+    route.push(current);
+
+    if (meters > targetDistanceMeters * 0.72 && localDistance(current, start) < targetDistanceMeters * 0.08 && Math.random() < 0.22) {
+      break;
+    }
+  }
+
+  const deduped = route.filter((node, index, array) => node.id !== array[index - 1]?.id);
+  if (meters < targetDistanceMeters * 0.42 || deduped.length < 8 || !routeUsesOnlyGraphEdges(graph, deduped)) return null;
+
+  const reuseStats = routeReuseStats(deduped);
+  if (reuseStats.reverseEdgeRatio > matchConfig.aiShapeExtremeBacktrackRatio) return null;
+  if (reuseStats.reverseEdgeRatio > matchConfig.aiShapeMaxReverseEdgeRatio && Math.random() < 0.9) return null;
+  if (reuseStats.undirectedReuseRatio > matchConfig.aiShapeMaxUndirectedReuseRatio && Math.random() < 0.88) return null;
+  if (reuseStats.immediateBacktrackRatio > matchConfig.aiShapeMaxImmediateBacktrackRatio && Math.random() < 0.92) return null;
+  if (reuseStats.uniqueNodeRatio < matchConfig.aiShapeMinUniqueNodeRatio && Math.random() < 0.82) return null;
+
+  return deduped;
+}
+
+async function generateLocalShapeCandidates(
+  graph: RoadGraph,
+  center: LatLng,
+  kilometers: number,
+  onProgress: (message: string) => void,
+  progressLabel: string,
+) {
+  const targetDistanceMeters = kilometers * 1000;
+  const referencePoints = graph.segments.flatMap((segment) => [segment.a, segment.b]);
+  const candidates: AiShapeCandidate[] = [];
+  const seen = new Set<string>();
+
+  for (let attempt = 0; attempt < matchConfig.aiShapeAttempts; attempt += 1) {
+    const route = randomWalkCandidate(graph, targetDistanceMeters);
+    if (route) {
+      const signature = route.filter((_, index) => index % Math.max(1, Math.floor(route.length / 8)) === 0).map((node) => node.id).join('|');
+      if (!seen.has(signature)) {
+        seen.add(signature);
+        const routeGeometry = expandRouteGeometry(graph, route);
+        const routePoints = routeGeometry.map((point) => ({ x: point.x, y: point.y }));
+        const reuseStats = routeReuseStats(route);
+        const localShapeScore = localShapeCandidateScore(graph, route, routePoints, targetDistanceMeters);
+        const routeLatLng = densifyLatLngRoute(
+          routeGeometry.map((point) => ({ lat: point.lat, lng: point.lng })),
+          center,
+          matchConfig.maxRenderedSegmentMeters,
+        );
+        const routeDistanceMeters = graphDistance(route);
+        candidates.push({
+          anchorErrorMeters: localShapeScore,
+          backtrackRatio: reuseStats.reverseEdgeRatio,
+          localShapeScore,
+          points: withPreviewPoints(routeLatLng, center, referencePoints),
+          reuseRatio: reuseStats.undirectedReuseRatio,
+          rank: candidates.length + 1,
+          routeDistanceMeters,
+          score: localShapeScore,
+          segmentRepairCount: 0,
+          shapeErrorMeters: localShapeScore,
+          startOffsetMeters: Math.hypot(route[0].x, route[0].y),
+          targetPoints: [],
+          uniqueNodeRatio: reuseStats.uniqueNodeRatio,
+          worstSegmentErrorMeters: localShapeScore,
+        });
+      }
+    }
+
+    if ((attempt + 1) % 25 === 0 || attempt === matchConfig.aiShapeAttempts - 1) {
+      onProgress(progressLabel + ': ' + String(attempt + 1) + '/' + String(matchConfig.aiShapeAttempts));
+      await waitForPaint();
+    }
+  }
+
+  return candidates
+    .sort((a, b) => a.localShapeScore - b.localShapeScore)
+    .slice(0, matchConfig.aiShapeCandidateCount)
+    .map((candidate, index) => ({ ...candidate, rank: index + 1 }));
+}
+
+function escapeSvgText(value: string) {
+  return value.replace(/[&<>"']/g, (character) => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&apos;',
+  }[character] ?? character));
+}
+
+function contactSheetPath(points: RoutePoint[], x: number, y: number, size: number) {
+  if (points.length < 2) return '';
+
+  const bounds = boundsOf(points);
+  const width = Math.max(bounds.maxX - bounds.minX, 0.001);
+  const height = Math.max(bounds.maxY - bounds.minY, 0.001);
+  const scale = size * 0.72 / Math.max(width, height);
+  const offsetX = x + size / 2 - (bounds.minX + width / 2) * scale;
+  const offsetY = y + size / 2 - (bounds.minY + height / 2) * scale;
+
+  return points.map((point, index) => {
+    const command = index === 0 ? 'M' : 'L';
+    return command + (point.x * scale + offsetX).toFixed(1) + ' ' + (point.y * scale + offsetY).toFixed(1);
+  }).join(' ');
+}
+
+function localizedShapeName(name: string, language: Language) {
+  if (language !== "cs") return name;
+
+  const names: Record<string, string> = {
+    arrow: "sipka",
+    bridge: "most",
+    bolt: "blesk",
+    bracket: "zavorka",
+    candle: "svicka",
+    chair: "zidle",
+    comb: "hreben",
+    cross: "kriz",
+    flag: "vlajka",
+    fork: "vidlicka",
+    gate: "brana",
+    hammer: "kladivo",
+    hook: "hak",
+    key: "klic",
+    kite: "drak",
+    ladder: "zebrik",
+    leaf: "list",
+    loop: "smycka",
+    moon: "mesic",
+    needle: "jehla",
+    ring: "kruh",
+    ribbon: "stuha",
+    sail: "plachta",
+    snake: "had",
+    tower: "vez",
+    wave: "vlna",
+    zigzag: "klikatice",
+  };
+
+  return names[name] ?? name;
+}
+
+function candidateFallbackNames(candidate: RouteCandidateOption, language: Language) {
+  const points = candidate.points.length > 6 ? resample(candidate.points, 72) : candidate.points;
+  if (points.length < 3) return [localizedShapeName("hook", language)];
+
+  const bounds = boundsOf(points);
+  const width = Math.max(bounds.maxX - bounds.minX, 1);
+  const height = Math.max(bounds.maxY - bounds.minY, 1);
+  const diagonal = Math.hypot(width, height);
+  const aspect = width / height;
+  const closureRatio = localDistance(points[0], points[points.length - 1]) / Math.max(diagonal, 1);
+  const areaRatio = polylineArea(points) / Math.max(width * height, 1);
+  const turnScore = routeTurnScore(points);
+  const aiCandidate = candidate as Partial<AiShapeCandidate>;
+  const names: string[] = [];
+  const add = (...items: string[]) => {
+    items.forEach((item) => {
+      if (!names.includes(item)) names.push(item);
+    });
+  };
+
+  if (closureRatio < 0.16 && areaRatio > 0.42 && aspect > 0.72 && aspect < 1.38) add("ring", "moon", "loop");
+  if (closureRatio < 0.24 && areaRatio > 0.26) add(aspect > 1.45 ? "leaf" : "loop", "ribbon", "kite");
+  if ((aiCandidate.reuseRatio ?? 0) > 0.16) add("ladder", "comb", "gate");
+  if (turnScore > 30 && areaRatio > 0.2) add("ribbon", "snake", "wave");
+  if (turnScore > 30 && areaRatio < 0.14 && aspect > 1.35 && closureRatio > 0.42) add("zigzag", "bolt", "wave");
+  if (aspect > 3.1) add(turnScore > 14 ? "snake" : "arrow", "bridge", "needle");
+  if (aspect < 0.34) add("tower", "candle", "needle");
+  if (closureRatio > 0.62 && turnScore > 16) add("hook", "bracket", "sail");
+  if (areaRatio > 0.34) add("kite", "flag", "sail");
+  if (turnScore > 18 && aspect > 1.4 && aspect < 2.8) add("key", "hammer", "fork");
+  if (turnScore < 10 && aspect > 1.5) add("bridge", "needle", "arrow");
+  if (turnScore < 12 && aspect < 0.7) add("candle", "tower", "flag");
+
+  const catalog = [
+    "hook",
+    "flag",
+    "key",
+    "sail",
+    "bolt",
+    "wave",
+    "fork",
+    "hammer",
+    "chair",
+    "bracket",
+    "bridge",
+    "comb",
+    "cross",
+    "gate",
+  ];
+  const seed = Math.abs(Math.round(width * 13 + height * 17 + turnScore * 19 + areaRatio * 1000 + closureRatio * 997));
+  for (let index = 0; index < catalog.length; index += 1) {
+    add(catalog[(seed + index * 5) % catalog.length]);
+  }
+
+  return names.map((name) => localizedShapeName(name, language));
+}
+
+function candidateFallbackName(candidate: RouteCandidateOption, language: Language) {
+  return candidateFallbackNames(candidate, language)[0];
+}
+
+function diversifyShapeLabels<T extends RouteCandidateOption>(candidates: T[], language: Language) {
+  const labelCounts = new Map<string, number>();
+
+  return candidates.map((candidate) => {
+    const currentLabel = candidate.aiLabel ?? candidateFallbackName(candidate, language);
+    const key = currentLabel.toLowerCase();
+    const count = labelCounts.get(key) ?? 0;
+    labelCounts.set(key, count + 1);
+
+    if (count === 0) return { ...candidate, aiLabel: currentLabel };
+
+    const replacement = candidateFallbackNames(candidate, language)
+      .find((name) => !labelCounts.has(name.toLowerCase()));
+    if (!replacement) return { ...candidate, aiLabel: currentLabel };
+
+    labelCounts.set(replacement.toLowerCase(), 1);
+    return { ...candidate, aiLabel: replacement };
+  });
+}
+
+function normalizeShapeSearch(value: string) {
+  return value
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+function targetShapeTerms(query: string) {
+  const normalized = normalizeShapeSearch(query);
+  const terms = new Set(normalized.split(/\s+/).filter((term) => term.length >= 2));
+  if (normalized) terms.add(normalized);
+
+  Array.from(terms).forEach((term) => {
+    if (term.endsWith("ies") && term.length > 4) terms.add(term.slice(0, -3) + "y");
+    if (term.endsWith("es") && term.length > 3) terms.add(term.slice(0, -2));
+    if (term.endsWith("s") && term.length > 3) terms.add(term.slice(0, -1));
+  });
+
+  const catTerms = ["cat", "cats", "kitten", "kitty", "feline", "kocka", "kocky", "kote", "kocici"];
+  if (catTerms.some((term) => terms.has(term))) {
+    ["cat", "kitten", "kitty", "feline", "kocka", "kote", "head", "face", "ears", "ear", "tail", "whiskers", "paw", "paws"].forEach((term) => terms.add(term));
+  }
+
+  return Array.from(terms);
+}
+
+function targetRecognitionScore(recognition: AiShapeRecognition | undefined, query: string) {
+  const normalizedQuery = normalizeShapeSearch(query);
+  if (!recognition || !normalizedQuery) return 0;
+
+  const haystack = normalizeShapeSearch([
+    recognition.label,
+    recognition.description,
+    recognition.reason,
+  ].filter(Boolean).join(" "));
+  if (!haystack) return 0;
+  if (haystack.includes(normalizedQuery)) return 1;
+
+  const haystackTokens = new Set(haystack.split(/\s+/));
+  const hits = targetShapeTerms(query).filter((term) => haystackTokens.has(term));
+  if (!hits.length) return 0;
+
+  return Math.min(0.9, 0.45 + hits.length * 0.18);
+}
+
+function cleanAiShapeLabel(label: string | undefined, fallback: string) {
+  if (!label) return fallback;
+
+  const stripped = label
+    .trim()
+    .replace(/^shape\s+(resembling|like)\s+(an?\s+)?/i, "")
+    .replace(/^route\s+(resembling|like)\s+(an?\s+)?/i, "")
+    .replace(/^tvar\s+(pripominajici|podobny|jako)\s+/i, "")
+    .replace(/^(a|an)\s+/i, "")
+    .trim();
+  const normalized = stripped.toLowerCase();
+  const forbidden = new Set([
+    "abstract route",
+    "abstract shape",
+    "generic route",
+    "generic shape",
+    "line",
+    "path",
+    "route",
+    "shape",
+    "street pattern",
+    "unknown",
+    "abstraktni trasa",
+    "abstraktni tvar",
+    "trasa",
+    "tvar",
+  ]);
+
+  if (!normalized || forbidden.has(normalized) || normalized.includes("abstract")) return fallback;
+  return stripped.slice(0, 32);
+}
+
+function svgDimensions(svg: string) {
+  const width = Number(svg.match(/width="([0-9.]+)"/)?.[1] ?? 660);
+  const height = Number(svg.match(/height="([0-9.]+)"/)?.[1] ?? 880);
+
+  return { width, height };
+}
+
+function pointFromUnknown(value: unknown): Point | null {
+  if (Array.isArray(value) && value.length >= 2) {
+    const x = Number(value[0]);
+    const y = Number(value[1]);
+    return Number.isFinite(x) && Number.isFinite(y) ? { x, y } : null;
+  }
+
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    const x = Number(record.x);
+    const y = Number(record.y);
+    return Number.isFinite(x) && Number.isFinite(y) ? { x, y } : null;
+  }
+
+  return null;
+}
+
+function normalizeAiVectorSketches(value: unknown): AiVectorSketch[] {
+  const shapes = Array.isArray((value as { shapes?: unknown })?.shapes)
+    ? (value as { shapes: unknown[] }).shapes
+    : [];
+
+  return shapes.flatMap((shape): AiVectorSketch[] => {
+    if (!shape || typeof shape !== "object") return [];
+
+    const record = shape as Record<string, unknown>;
+    const label = typeof record.label === "string" && record.label.trim()
+      ? record.label.trim().slice(0, 48)
+      : "";
+    const description = typeof record.description === "string" ? record.description.trim().slice(0, 220) : "";
+    const rawStrokes = Array.isArray(record.strokes)
+      ? record.strokes
+      : Array.isArray(record.points)
+        ? [record.points]
+        : [];
+    const strokes = rawStrokes
+      .map((stroke) => Array.isArray(stroke)
+        ? stroke.flatMap((point) => {
+          const parsed = pointFromUnknown(point);
+          return parsed ? [parsed] : [];
+        })
+        : [])
+      .filter((stroke) => stroke.length >= 2);
+
+    if (!label || !strokes.length) return [];
+    return [{
+      closed: Boolean(record.closed),
+      description,
+      label,
+      strokes,
+    }];
+  });
+}
+
+async function svgToPngDataUrl(svg: string) {
+  const { width, height } = svgDimensions(svg);
+  const url = URL.createObjectURL(new Blob([svg], { type: "image/svg+xml" }));
+  const image = new Image();
+
+  try {
+    await new Promise<void>((resolve, reject) => {
+      image.onload = () => resolve();
+      image.onerror = () => reject(new Error("Could not rasterize AI contact sheet."));
+      image.src = url;
+    });
+
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const context = canvas.getContext("2d");
+    if (!context) throw new Error("Canvas is unavailable.");
+
+    context.fillStyle = "#ffffff";
+    context.fillRect(0, 0, width, height);
+    context.drawImage(image, 0, 0, width, height);
+
+    return canvas.toDataURL("image/png");
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
+function aiShapeContactSheetSvg(candidates: AiShapeCandidate[]) {
+  const columns = 4;
+  const cell = 240;
+  const rows = Math.ceil(candidates.length / columns);
+  const width = columns * cell;
+  const height = rows * cell;
+  const tiles = candidates.map((candidate, index) => {
+    const x = index % columns * cell;
+    const y = Math.floor(index / columns) * cell;
+    return '<g><rect x="' + x + '" y="' + y + '" width="' + cell + '" height="' + cell + '" fill="white" stroke="#d4d4d8"/>'
+      + '<text x="' + (x + 14) + '" y="' + (y + 26) + '" font-family="Arial" font-size="18" font-weight="700" fill="#111827">#' + candidate.rank + '</text>'
+      + '<path d="' + contactSheetPath(candidate.points, x, y + 18, cell - 20) + '" fill="none" stroke="#111827" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>'
+      + '</g>';
+  }).join('');
+
+  return '<svg xmlns="http://www.w3.org/2000/svg" width="' + width + '" height="' + height + '" viewBox="0 0 ' + width + ' ' + height + '"><rect width="100%" height="100%" fill="white"/>' + tiles + '</svg>';
+}
+
+async function recognizeShapeCandidatesWithAi(candidates: AiShapeCandidate[], language: Language, shapeQuery: string) {
+  const endpoint = (import.meta.env.VITE_AI_SHAPE_API_URL as string | undefined)?.trim() || '/api/ai-recognize-shapes';
+  const requestCandidates = candidates.slice(0, matchConfig.aiShapeMaxRequestCandidates);
+  const requestedShapes = shapeQuery.trim();
+  const contactSheetSvg = aiShapeContactSheetSvg(requestCandidates);
+  const contactSheetImage = await svgToPngDataUrl(contactSheetSvg);
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      candidates: requestCandidates.map((candidate) => ({
+        backtrackPercent: Math.round(candidate.backtrackRatio * 100),
+        distanceKm: Number((candidate.routeDistanceMeters / 1000).toFixed(2)),
+        id: candidate.rank,
+        localScore: Number(candidate.localShapeScore.toFixed(1)),
+        reusedStreetPercent: Math.round(candidate.reuseRatio * 100),
+        uniqueNodePercent: Math.round(candidate.uniqueNodeRatio * 100),
+      })),
+      contactSheetImage,
+      contactSheetSvg,
+      language,
+      shapeQuery: requestedShapes,
+    }),
+  });
+
+  if (!response.ok) throw new Error('AI shape recognition is unavailable.');
+  const json = await response.json() as { results?: AiShapeRecognition[] };
+  return Array.isArray(json.results) ? json.results : [];
+}
+
+async function generateAiVectorSketches(shapeQuery: string, language: Language) {
+  const endpoint = (import.meta.env.VITE_AI_VECTOR_SHAPE_API_URL as string | undefined)?.trim() || '/api/ai-generate-shapes';
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      count: matchConfig.aiVectorShapeLimit,
+      language,
+      shapeQuery,
+    }),
+  });
+
+  if (!response.ok) throw new Error('AI vector sketch generation is unavailable.');
+  const json = await response.json() as unknown;
+  return normalizeAiVectorSketches(json);
+}
+
+async function generateAiShapeVariants(shapeQuery: string, language: Language) {
+  const sketches = await generateAiVectorSketches(shapeQuery, language);
+  return aiVectorSketchVariants(sketches);
+}
+
+function nameAiShapeCandidates(candidates: AiShapeCandidate[], language: Language) {
+  return diversifyShapeLabels(candidates.map((candidate) => ({
+    ...candidate,
+    aiConfidence: candidate.aiConfidence ?? 0,
+    aiLabel: candidate.aiLabel ?? candidateFallbackName(candidate, language),
+  })), language);
+}
+
+function weakTargetDescription(shapeQuery: string, language: Language) {
+  return language === "cs"
+    ? "AI nenaslo presvedcivou shodu pro " + shapeQuery + "; toto je jen nejblizsi kandidat podle tvaru trasy."
+    : "AI did not find a convincing " + shapeQuery + "; this is only the closest route candidate by silhouette.";
+}
+
+function mergeAiShapeRecognitions(candidates: AiShapeCandidate[], recognitions: AiShapeRecognition[], language: Language, shapeQuery: string) {
+  const recognitionById = new Map(recognitions.map((recognition) => [recognition.id, recognition]));
+  const requestedShape = shapeQuery.trim();
+  const hasTarget = Boolean(requestedShape);
+
+  const mapped = candidates
+    .map((candidate) => {
+      const recognition = recognitionById.get(candidate.rank);
+      const confidence = typeof recognition?.confidence === 'number'
+        ? Math.max(0, Math.min(1, recognition.confidence))
+        : undefined;
+      const targetTextScore = targetRecognitionScore(recognition, requestedShape);
+      const aiTargetConfidence = typeof recognition?.targetConfidence === 'number'
+        ? Math.max(0, Math.min(1, recognition.targetConfidence))
+        : targetTextScore;
+      const targetEvidence = recognition?.matchesTarget === true || targetTextScore >= 0.45;
+      const matchesTarget = hasTarget
+        && targetEvidence
+        && aiTargetConfidence >= matchConfig.aiShapeTargetConfidenceMin;
+      const fallbackLabel = candidateFallbackName(candidate, language);
+      const qualityDrag = candidate.reuseRatio * 180
+        + candidate.backtrackRatio * 240
+        + Math.max(0, matchConfig.aiShapeMinUniqueNodeRatio - candidate.uniqueNodeRatio) * 220;
+      const effectiveConfidence = hasTarget
+        ? Math.max(0, aiTargetConfidence - candidate.reuseRatio * 0.65 - candidate.backtrackRatio * 0.9)
+        : typeof confidence === 'number'
+          ? Math.max(0, confidence - candidate.reuseRatio * 0.6 - candidate.backtrackRatio * 0.8)
+          : 0;
+      const targetPenalty = hasTarget
+        ? matchesTarget
+          ? -aiTargetConfidence * 1450 - targetTextScore * 220
+          : 3200 + Math.max(0, matchConfig.aiShapeTargetConfidenceMin - aiTargetConfidence) * 900
+        : 0;
+      const aiDescription = recognition?.description?.trim() || recognition?.reason?.trim() || undefined;
+
+      return {
+        ...candidate,
+        aiConfidence: hasTarget ? aiTargetConfidence : confidence ?? 0,
+        aiDescription: hasTarget && !matchesTarget ? weakTargetDescription(requestedShape, language) : aiDescription,
+        aiLabel: hasTarget && !matchesTarget
+          ? requestedShape.slice(0, 32)
+          : cleanAiShapeLabel(recognition?.label, fallbackLabel),
+        aiMatchesTarget: matchesTarget,
+        aiReason: recognition?.reason?.trim() || undefined,
+        aiTargetConfidence,
+        score: candidate.localShapeScore + qualityDrag + targetPenalty - effectiveConfidence * 180,
+      };
+    })
+    .sort((a, b) => a.score - b.score)
+    .map((candidate, index) => ({ ...candidate, rank: index + 1 }));
+
+  const ranked = hasTarget ? mapped : diversifyShapeLabels(mapped, language);
+  if (!hasTarget) return ranked;
+
+  const targetMatches = ranked.filter((candidate) => candidate.aiMatchesTarget);
+  return (targetMatches.length ? targetMatches : ranked.slice(0, Math.min(8, ranked.length)))
+    .map((candidate, index) => ({ ...candidate, rank: index + 1 }));
+}
+
 async function roadMatchedRoute(
   graph: RoadGraph,
   variants: ShapeVariant[],
@@ -2386,6 +3304,7 @@ async function roadMatchedRoute(
 
   variants.forEach((variant) => {
     const baseTargets = targetMeters(variant.points, kilometers);
+    const scoringTargets = variant.aiGeneratedSketch ? baseTargets : primaryBaseTargets;
 
     for (const scale of scales) {
       for (const rotation of rotations) {
@@ -2397,11 +3316,14 @@ async function roadMatchedRoute(
             y: startAnchor.y - rotatedStart.y,
           };
           rawCandidates.push({
-            primaryTargets: transformPoints(primaryBaseTargets, scale, rotation, offset),
+            primaryTargets: transformPoints(scoringTargets, scale, rotation, offset),
             startDrift: Math.hypot(startAnchor.x, startAnchor.y),
             shapePenalty: variant.penalty,
             rotationPenalty: rotationPreferencePenalty(rotation),
             targets: transformPoints(baseTargets, scale, rotation, offset),
+            variantDescription: variant.description,
+            variantIsAi: variant.aiGeneratedSketch,
+            variantName: variant.name,
           });
         }
       }
@@ -2418,11 +3340,14 @@ async function roadMatchedRoute(
       };
 
       rawCandidates.push({
-        primaryTargets: transformPoints(primaryBaseTargets, scale, rotation, offset),
+        primaryTargets: transformPoints(scoringTargets, scale, rotation, offset),
         startDrift: Math.hypot(startAnchor.x, startAnchor.y),
         shapePenalty: variant.penalty + 120,
         rotationPenalty: rotationPreferencePenalty(rotation),
         targets: transformPoints(baseTargets, scale, rotation, offset),
+        variantDescription: variant.description,
+        variantIsAi: variant.aiGeneratedSketch,
+        variantName: variant.name,
       });
     }
   });
@@ -2503,6 +3428,9 @@ async function roadMatchedRoute(
     shapeScore: ShapeScore;
     targetPoints: Point[];
     worstSegmentError: number;
+    variantName?: string;
+    variantDescription?: string;
+    variantIsAi?: boolean;
   };
 
   let segmentRepairsTried = 0;
@@ -2552,6 +3480,9 @@ async function roadMatchedRoute(
       shapeScore,
       targetPoints: candidate.primaryTargets,
       worstSegmentError,
+      variantDescription: candidate.variantDescription,
+      variantIsAi: candidate.variantIsAi,
+      variantName: candidate.variantName,
     };
   }
 
@@ -2620,6 +3551,10 @@ async function roadMatchedRoute(
   function toCandidateOption(candidate: RankedRouteCandidate): RouteCandidateOption {
     const routeLatLng = candidateRouteLatLng(candidate);
     return {
+      aiConfidence: candidate.variantIsAi ? 1 : undefined,
+      aiDescription: candidate.variantIsAi ? candidate.variantDescription : undefined,
+      aiGeneratedSketch: candidate.variantIsAi,
+      aiLabel: candidate.variantIsAi ? candidate.variantName : undefined,
       anchorErrorMeters: candidate.shapeScore.anchorError,
       points: withPreviewPoints(routeLatLng, center, referencePoints),
       rank: rankedRoutes.indexOf(candidate) + 1,
@@ -2912,6 +3847,9 @@ function App() {
   const [isSearchingLocations, setIsSearchingLocations] = useState(false);
   const [isLocationFocused, setIsLocationFocused] = useState(false);
   const [distanceKm, setDistanceKm] = useState(5);
+  const [aiShapeQuery, setAiShapeQuery] = useState(loadSavedAiShapeQuery);
+  const [aiSketchSuggestions, setAiSketchSuggestions] = useState<ShapeVariant[]>([]);
+  const [shapeInputMode, setShapeInputMode] = useState<ShapeInputMode>("draw");
   const [drawnPath, setDrawnPath] = useState<Point[] | null>(null);
   const [drawingStrokes, setDrawingStrokes] = useState<Point[][]>([]);
   const [drawingPoints, setDrawingPoints] = useState<Point[]>([]);
@@ -2920,11 +3858,13 @@ function App() {
   const [targetRoute, setTargetRoute] = useState<RoutePoint[] | null>(null);
   const [routeCandidates, setRouteCandidates] = useState<RouteCandidateOption[]>([]);
   const [selectedCandidateIndex, setSelectedCandidateIndex] = useState(0);
+  const [hoveredCandidateIndex, setHoveredCandidateIndex] = useState<number | null>(null);
   const [roadSegments, setRoadSegments] = useState<RoadSegment[]>([]);
   const [cachedRoadTiles, setCachedRoadTiles] = useState<RoadTileArea[]>([]);
   const [roadCenter, setRoadCenter] = useState<LatLng | null>(null);
   const [roadStatus, setRoadStatus] = useState<string>(() => t.status.initial);
   const [isMatchingRoads, setIsMatchingRoads] = useState(false);
+  const [isFindingShapes, setIsFindingShapes] = useState(false);
   const [matchPhase, setMatchPhase] = useState("");
   const [isMapLoading, setIsMapLoading] = useState(true);
   const [matchTiming, setMatchTiming] = useState<MatchTiming | null>(null);
@@ -2938,12 +3878,14 @@ function App() {
   const targetLayerRef = useRef<L.Polyline | null>(null);
   const routeLayerRef = useRef<L.Polyline | null>(null);
   const candidateLayerRef = useRef<L.LayerGroup | null>(null);
+  const routeHoverLayerRef = useRef<L.LayerGroup | null>(null);
   const tileLayerRef = useRef<L.LayerGroup | null>(null);
   const roadLayerRef = useRef<L.LayerGroup | null>(null);
   const centerMarkerRef = useRef<L.CircleMarker | null>(null);
   const startMarkerRef = useRef<L.CircleMarker | null>(null);
   const endMarkerRef = useRef<L.CircleMarker | null>(null);
   const matchRequestRef = useRef(0);
+  const roadGraphRef = useRef<RoadGraph | null>(null);
 
   const profileLabel = (profile: RoadQueryProfile) => profile.id === "compact" ? t.compactRoads : t.broadRoads;
   const sourceLabel = (source: string) => {
@@ -2980,20 +3922,34 @@ function App() {
     })),
     [],
   );
+  const aiSketchPreviews = useMemo(
+    () => aiSketchSuggestions.map((suggestion) => ({
+      description: suggestion.description,
+      name: suggestion.name,
+      points: pathPreviewPoints(suggestion.points),
+    })),
+    [aiSketchSuggestions],
+  );
   const center = selectedLocation ?? parseLocation(location);
   const sketchRoute = useMemo(() => {
     const sampled = resample(sourcePoints, 280);
     return projectToLatLng(sampled, center, distanceKm);
   }, [sourcePoints, center.lat, center.lng, distanceKm]);
+  const aiShapeTarget = aiShapeQuery.trim();
   const hasWalkableRoute = Boolean(roadRoute?.length);
   const route = roadRoute?.length ? roadRoute : sketchRoute;
+  const selectedRouteCandidate = routeCandidates[selectedCandidateIndex] ?? null;
+  const selectedAiDescription = selectedRouteCandidate?.aiLabel && selectedRouteCandidate.aiDescription
+    ? selectedRouteCandidate.aiGeneratedSketch
+      ? t.aiSketchDescription(selectedRouteCandidate.aiLabel, selectedRouteCandidate.aiDescription)
+      : t.aiShapeDescription(
+        selectedRouteCandidate.aiLabel,
+        Math.round((selectedRouteCandidate.aiConfidence ?? 0) * 100),
+        selectedRouteCandidate.aiDescription,
+      )
+    : "";
   const startSearchMeters = startSearchRadiusMeters(distanceKm);
-  const matchTryCount = sourceVariants.length * (
-    matchConfig.scales.length
-    * matchConfig.rotations.length
-    * startAnchors(startSearchMeters).length
-    + matchConfig.randomCandidatesPerVariant
-  );
+  const matchTryCount = routePlacementTryCount(sourceVariants.length, startSearchMeters);
   const stats = routeStats(route);
   const bounds = {
     north: Math.max(...route.map((point) => point.lat)),
@@ -3001,7 +3957,8 @@ function App() {
     east: Math.max(...route.map((point) => point.lng)),
     west: Math.min(...route.map((point) => point.lng)),
   };
-  const mapOverlayText = isMatchingRoads
+  const isRouteBusy = isMatchingRoads || isFindingShapes;
+  const mapOverlayText = isRouteBusy
       ? matchPhase || t.calculatingWalkableRoute
       : isMapLoading
         ? t.loadingMapTiles
@@ -3013,13 +3970,17 @@ function App() {
     setTargetRoute(null);
     setRouteCandidates([]);
     setSelectedCandidateIndex(0);
+    setHoveredCandidateIndex(null);
     setRoadSegments([]);
     setCachedRoadTiles([]);
+    roadGraphRef.current = null;
     setRoadCenter(null);
     setMatchTiming(null);
     setGraphInfo(null);
+    setAiSketchSuggestions([]);
     setMatchPhase("");
     setIsMatchingRoads(false);
+    setIsFindingShapes(false);
     setRoadStatus(t.status.inputsChanged);
   }
 
@@ -3141,7 +4102,151 @@ function App() {
     context.moveTo(previewPath[0].x, previewPath[0].y);
     previewPath.slice(1).forEach((point) => context.lineTo(point.x, point.y));
     context.stroke();
-  }, [drawingStrokes, drawingPoints]);
+  }, [drawingStrokes, drawingPoints, shapeInputMode]);
+
+
+  async function handleFindAiShapes() {
+    const requestId = matchRequestRef.current + 1;
+    matchRequestRef.current = requestId;
+    const startedAt = performance.now();
+    const requestedShape = aiShapeTarget || description;
+    let roadSearchMs = 0;
+    let routeMs = 0;
+    let hasLoadedGraph = false;
+    setIsFindingShapes(true);
+    setHoveredCandidateIndex(null);
+    setMatchTiming(null);
+    setMatchPhase(t.progress.aiSketching(requestedShape));
+    setRoadStatus(t.status.aiSketching(requestedShape));
+
+    try {
+      const resolvedCenter = selectedLocation ?? await resolveLocation(location);
+      const aiVariants = await generateAiShapeVariants(requestedShape, language);
+      if (!aiVariants.length) throw new Error(t.status.aiSketchNoShapes);
+      if (requestId !== matchRequestRef.current) return;
+
+      setAiSketchSuggestions(aiVariants.filter((variant, index) => variant.aiGeneratedSketch && index % 2 === 0));
+      setDescription(aiVariants[0].name);
+      setMatchPhase(t.status.aiLoadingGraph);
+      setRoadStatus(t.status.aiLoadingGraph);
+
+      let graph = roadGraphRef.current;
+      let roadFetch: Awaited<ReturnType<typeof fetchUsableRoadGraph>> | null = null;
+      if (!graph) {
+        const radius = Math.max(
+          ...aiVariants.map((variant) => roadSearchRadiusMeters(variant.points, distanceKm, startSearchMeters)),
+        );
+        const roadSearchStartedAt = performance.now();
+        roadFetch = await fetchUsableRoadGraph(resolvedCenter, radius, setMatchPhase, graphPhaseMessages, (tiles) => {
+          if (requestId === matchRequestRef.current) setCachedRoadTiles(tiles);
+        });
+        roadSearchMs = performance.now() - roadSearchStartedAt;
+        graph = roadFetch.graph;
+        roadGraphRef.current = graph;
+        hasLoadedGraph = true;
+        setGraphInfo({
+          cacheVersion: matchConfig.graphCacheVersion,
+          source: roadFetch.source,
+          profile: profileLabel(roadFetch.profile),
+          radiusMeters: roadFetch.radiusMeters,
+          spacingMeters: matchConfig.roadNodeSpacingMeters,
+          nodes: graph.nodes.size,
+          edges: graph.edgeKeys.size,
+          rejectedSegments: graph.rejectedSegments,
+          tileCount: roadFetch.tileCount,
+          failedTiles: roadFetch.failedTiles,
+        });
+        setCachedRoadTiles(roadFetch.tiles);
+      }
+
+      if (requestId !== matchRequestRef.current) return;
+      const aiMatchTryCount = routePlacementTryCount(aiVariants.length, startSearchMeters);
+      setMatchPhase(t.progress.testingPlacements(aiMatchTryCount, Math.round(startSearchMeters)));
+      setRoadStatus(t.status.testing(aiMatchTryCount, matchConfig.topCandidates));
+      await waitForPaint();
+
+      const routeStartedAt = performance.now();
+      const matchedResult = await roadMatchedRoute(graph, aiVariants, resolvedCenter, distanceKm, (message) => {
+        if (requestId === matchRequestRef.current) setMatchPhase(message);
+      }, progressLabels);
+      const matched = matchedResult.points;
+      routeMs = performance.now() - routeStartedAt;
+      if (requestId !== matchRequestRef.current) return;
+      if (matched.length < 2) throw new Error(t.status.roadDataNoRoute);
+
+      setRouteCandidates(matchedResult.candidates);
+      setSelectedCandidateIndex(matchedResult.selectedCandidateIndex);
+      setRoadRoute(matched);
+      setTargetRoute(matchedResult.targetPoints);
+      setRoadSegments(graph.segments);
+      setRoadCenter(resolvedCenter);
+      setHasLoadedOnce(true);
+      setMatchTiming({
+        totalMs: performance.now() - startedAt,
+        roadSearchMs,
+        routeMs,
+        placements: aiMatchTryCount,
+        rankedRoutes: matchedResult.rankedRoutes,
+        selectedRouteRank: matchedResult.selectedRouteRank,
+        choicePoolSize: matchedResult.candidates.length,
+        shapeErrorMeters: matchedResult.shapeErrorMeters,
+        anchorErrorMeters: matchedResult.anchorErrorMeters,
+        worstSegmentErrorMeters: matchedResult.worstSegmentErrorMeters,
+        segmentRepairsTried: matchedResult.segmentRepairsTried,
+        selectedSegmentRepairs: matchedResult.selectedSegmentRepairs,
+        startOffsetMeters: matchedResult.startOffsetMeters,
+      });
+
+      const matchedStats = routeStats(matched);
+      const choiceStatus = matchedResult.candidates.length > 1
+        ? t.status.showingOption(matchedResult.selectedRouteRank, matchedResult.candidates.length)
+        : t.status.choseBest;
+      const rankingStatus = matchedResult.fallbackUsed
+        ? t.status.fallback
+        : t.status.rankedCandidates(matchedResult.rankedRoutes, choiceStatus);
+      const startStatus = matchedResult.startOffsetMeters > 30
+        ? t.status.startMoved(Math.round(matchedResult.startOffsetMeters))
+        : t.status.startNear;
+      const shapeStatus = typeof matchedResult.shapeErrorMeters === "number"
+        ? t.status.shapeError(
+          Math.round(matchedResult.shapeErrorMeters),
+          Math.round(matchedResult.anchorErrorMeters ?? matchedResult.shapeErrorMeters),
+          Math.round(matchedResult.worstSegmentErrorMeters ?? matchedResult.shapeErrorMeters),
+        )
+        : "";
+      const repairStatus = matchedResult.segmentRepairsTried
+        ? t.status.repairs(matchedResult.segmentRepairsTried, matchedResult.selectedSegmentRepairs)
+        : "";
+      const resultStatus = t.status.result(rankingStatus, startStatus, matchedStats.kilometers.toFixed(2), shapeStatus, repairStatus);
+      setMatchPhase('');
+      setRoadStatus(t.status.aiSketchMatched(Math.ceil(aiVariants.length / 2), requestedShape, resultStatus));
+    } catch (error) {
+      if (requestId !== matchRequestRef.current) return;
+      setRoadRoute(null);
+      setTargetRoute(null);
+      setRouteCandidates([]);
+      setSelectedCandidateIndex(0);
+      setRoadSegments([]);
+      setRoadCenter(null);
+      if (!hasLoadedGraph) {
+        setGraphInfo(null);
+        setCachedRoadTiles([]);
+        roadGraphRef.current = null;
+      }
+      setMatchPhase('');
+      setRoadStatus(error instanceof Error ? error.message : t.status.roadMatchingFailed);
+      setMatchTiming({
+        totalMs: performance.now() - startedAt,
+        roadSearchMs,
+        routeMs,
+      });
+    } finally {
+      if (requestId === matchRequestRef.current) {
+        setIsFindingShapes(false);
+        setMatchPhase('');
+      }
+    }
+  }
 
   async function handleMatchRoads() {
     const requestId = matchRequestRef.current + 1;
@@ -3151,6 +4256,7 @@ function App() {
     let routeMs = 0;
     let hasLoadedGraph = false;
     setIsMatchingRoads(true);
+    setHoveredCandidateIndex(null);
     setMatchTiming(null);
     setMatchPhase(t.progress.resolvingStart);
     setRoadStatus(t.status.checkingCache);
@@ -3217,8 +4323,11 @@ function App() {
       }
       const radius = roadSearchRadiusMeters(sourcePoints, distanceKm, startSearchMeters);
       const roadSearchStartedAt = performance.now();
-      const roadFetch = await fetchUsableRoadGraph(resolvedCenter, radius, setMatchPhase, graphPhaseMessages);
+      const roadFetch = await fetchUsableRoadGraph(resolvedCenter, radius, setMatchPhase, graphPhaseMessages, (tiles) => {
+        if (requestId === matchRequestRef.current) setCachedRoadTiles(tiles);
+      });
       const graph = roadFetch.graph;
+      roadGraphRef.current = graph;
       roadSearchMs = performance.now() - roadSearchStartedAt;
       hasLoadedGraph = true;
       setGraphInfo({
@@ -3308,6 +4417,7 @@ function App() {
       if (!hasLoadedGraph) {
         setGraphInfo(null);
         setCachedRoadTiles([]);
+        roadGraphRef.current = null;
       }
       setMatchTiming({
         totalMs: performance.now() - startedAt,
@@ -3336,6 +4446,10 @@ function App() {
   useEffect(() => {
     window.localStorage.setItem(savedLanguageKey, language);
   }, [language]);
+
+  useEffect(() => {
+    window.localStorage.setItem(savedAiShapeQueryKey, aiShapeQuery);
+  }, [aiShapeQuery]);
 
   useEffect(() => {
     if (!mapElementRef.current || mapRef.current) return undefined;
@@ -3496,11 +4610,16 @@ function App() {
           },
         )
           .on("click", () => selectRouteCandidate(index))
-          .bindTooltip(`#${candidate.rank} · ${(candidate.routeDistanceMeters / 1000).toFixed(2)} km`, {
-            direction: "top",
-            opacity: 0.88,
-            sticky: true,
-          })
+          .bindTooltip(
+            candidate.aiLabel
+              ? '#' + candidate.rank + ' · ' + candidate.aiLabel + ' · ' + (candidate.routeDistanceMeters / 1000).toFixed(2) + ' km'
+              : '#' + candidate.rank + ' · ' + (candidate.routeDistanceMeters / 1000).toFixed(2) + ' km · ' + t.shapeShort + ' ' + Math.round(candidate.shapeErrorMeters) + 'm',
+            {
+              direction: "top",
+              opacity: 0.88,
+              sticky: true,
+            },
+          )
           .addTo(candidateLayerRef.current!);
       });
     }
@@ -3515,6 +4634,35 @@ function App() {
       smoothFactor: 0,
       noClip: true,
     }).addTo(map);
+
+    if (!routeHoverLayerRef.current) {
+      routeHoverLayerRef.current = L.layerGroup().addTo(map);
+    }
+    routeHoverLayerRef.current.clearLayers();
+    const hoveredCandidate = hoveredCandidateIndex === null ? null : routeCandidates[hoveredCandidateIndex];
+    if (hasWalkableRoute && hoveredCandidate?.points.length) {
+      const hoveredLatLngs = hoveredCandidate.points.map((point) => L.latLng(point.lat, point.lng));
+      L.polyline(hoveredLatLngs, {
+        color: "#fffdf8",
+        weight: 11,
+        opacity: 0.9,
+        lineCap: "round",
+        lineJoin: "round",
+        smoothFactor: 0,
+        noClip: true,
+        interactive: false,
+      }).addTo(routeHoverLayerRef.current);
+      L.polyline(hoveredLatLngs, {
+        color: hoveredCandidateIndex === selectedCandidateIndex ? "#fc4c02" : "#0e7490",
+        weight: 7,
+        opacity: 0.96,
+        lineCap: "round",
+        lineJoin: "round",
+        smoothFactor: 0,
+        noClip: true,
+        interactive: false,
+      }).addTo(routeHoverLayerRef.current);
+    }
 
     const start = routeLatLngs[0];
     const end = routeLatLngs[routeLatLngs.length - 1];
@@ -3546,7 +4694,7 @@ function App() {
       const routeBounds = L.latLngBounds(routeLatLngs);
       map.fitBounds(routeBounds.pad(0.18), { animate: true, maxZoom: 16 });
     }
-  }, [route, roadSegments, cachedRoadTiles, targetRoute, routeCandidates, selectedCandidateIndex, hasWalkableRoute, center.lat, center.lng]);
+  }, [route, roadSegments, cachedRoadTiles, targetRoute, routeCandidates, selectedCandidateIndex, hoveredCandidateIndex, hasWalkableRoute, center.lat, center.lng, language]);
 
   useEffect(() => {
     const query = location.trim();
@@ -3602,26 +4750,6 @@ function App() {
             </div>
           </div>
 
-
-          <div className="drawingPad">
-            <div className="drawingHeader">
-              <span>{t.drawPath}</span>
-              <button type="button" onClick={handleDrawingClear} disabled={!drawingStrokes.length && !drawingPoints.length && !drawnPath}>
-                {t.clear}
-              </button>
-            </div>
-            <canvas
-              ref={drawingCanvasRef}
-              width={drawingCanvasWidth}
-              height={drawingCanvasHeight}
-              onPointerDown={handleDrawingStart}
-              onPointerMove={handleDrawingMove}
-              onPointerUp={finishDrawing}
-              onPointerCancel={finishDrawing}
-              onLostPointerCapture={finishDrawing}
-              aria-label={t.drawnRouteShape}
-            />
-          </div>
 
           <label>
             {t.startLocation}
@@ -3682,36 +4810,133 @@ function App() {
             </div>
           </label>
 
-          <div className="shapeGrid" aria-label={t.shapePresets}>
-            {templatePreviews.map((template) => (
-              <button
-                key={template.name}
-                className={description.toLowerCase().includes(template.name) && !drawnPath ? "selectedShape" : undefined}
-                type="button"
-                onClick={() => {
-                  setDescription(template.name);
-                  resetDrawing();
-                  clearRoadMatch();
-                }}
-                aria-label={t.useShape(t.templateLabels[template.name])}
-              >
-                <svg viewBox="0 0 100 100" aria-hidden="true">
-                  <rect x="5" y="5" width="90" height="90" rx="8" />
-                  <polyline points={template.points} />
-                </svg>
-                <span>{t.templateLabels[template.name]}</span>
-              </button>
-            ))}
+          <div className="shapeInputTabs" role="tablist" aria-label={t.shapePresets}>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={shapeInputMode === "draw"}
+              className={shapeInputMode === "draw" ? "selectedInputTab" : undefined}
+              onClick={() => setShapeInputMode("draw")}
+            >
+              {t.shapeInputTabs.draw}
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={shapeInputMode === "ai"}
+              className={shapeInputMode === "ai" ? "selectedInputTab" : undefined}
+              onClick={() => setShapeInputMode("ai")}
+            >
+              {t.shapeInputTabs.ai}
+            </button>
           </div>
 
-          <button
-            className="secondary"
-            type="button"
-            onClick={handleMatchRoads}
-            disabled={isMatchingRoads}
-          >
-            {isMatchingRoads ? t.matchingRoads : t.matchRoads}
-          </button>
+          {shapeInputMode === "draw" ? (
+            <div className="shapeInputPanel" role="tabpanel">
+              <div className="drawingPad">
+                <div className="drawingHeader">
+                  <span>{t.drawPath}</span>
+                  <button type="button" onClick={handleDrawingClear} disabled={!drawingStrokes.length && !drawingPoints.length && !drawnPath}>
+                    {t.clear}
+                  </button>
+                </div>
+                <canvas
+                  ref={drawingCanvasRef}
+                  width={drawingCanvasWidth}
+                  height={drawingCanvasHeight}
+                  onPointerDown={handleDrawingStart}
+                  onPointerMove={handleDrawingMove}
+                  onPointerUp={finishDrawing}
+                  onPointerCancel={finishDrawing}
+                  onLostPointerCapture={finishDrawing}
+                  aria-label={t.drawnRouteShape}
+                />
+              </div>
+
+              <div className="shapeGrid" aria-label={t.shapePresets}>
+                {templatePreviews.map((template) => (
+                  <button
+                    key={template.name}
+                    className={description.toLowerCase().includes(template.name) && !drawnPath ? "selectedShape" : undefined}
+                    type="button"
+                    onClick={() => {
+                      setDescription(template.name);
+                      resetDrawing();
+                      clearRoadMatch();
+                    }}
+                    aria-label={t.useShape(t.templateLabels[template.name])}
+                  >
+                    <svg viewBox="0 0 100 100" aria-hidden="true">
+                      <rect x="5" y="5" width="90" height="90" rx="8" />
+                      <polyline points={template.points} />
+                    </svg>
+                    <span>{t.templateLabels[template.name]}</span>
+                  </button>
+                ))}
+              </div>
+
+              <button
+                className="secondary"
+                type="button"
+                onClick={handleMatchRoads}
+                disabled={isRouteBusy}
+              >
+                {isMatchingRoads ? t.matchingRoads : t.matchRoads}
+              </button>
+            </div>
+          ) : (
+            <div className="shapeInputPanel aiOptionsPanel" role="tabpanel">
+              <label>
+                {t.aiShapeSearch}
+                <input
+                  value={aiShapeQuery}
+                  onChange={(event) => {
+                    setAiShapeQuery(event.target.value);
+                    clearRoadMatch();
+                  }}
+                  placeholder={t.aiShapeSearchPlaceholder}
+                  autoComplete="off"
+                />
+              </label>
+
+              <button
+                className="secondary"
+                type="button"
+                onClick={handleFindAiShapes}
+                disabled={isRouteBusy}
+              >
+                {isFindingShapes ? t.findingAiShapes(aiShapeTarget) : t.findAiShapes(aiShapeTarget)}
+              </button>
+
+              {aiSketchPreviews.length ? (
+                <div className="aiSketchSuggestions" aria-label={t.aiSuggestedShapes}>
+                  {aiSketchPreviews.map((suggestion, index) => (
+                    <button
+                      key={`${suggestion.name}-${index}`}
+                      type="button"
+                      title={suggestion.description || suggestion.name}
+                      aria-label={t.useShape(suggestion.name)}
+                      onClick={() => {
+                        const sketch = aiSketchSuggestions[index];
+                        if (!sketch) return;
+
+                        setDescription(sketch.name);
+                        setDrawnPath(sketch.points);
+                        setFinishedDrawingStrokes([]);
+                        setDrawingStroke([]);
+                        clearRoadMatch();
+                      }}
+                    >
+                      <svg viewBox="0 0 100 100" aria-hidden="true">
+                        <polyline points={suggestion.points} />
+                      </svg>
+                      <span>{suggestion.name}</span>
+                    </button>
+                  ))}
+                </div>
+              ) : null}
+            </div>
+          )}
 
           <button
             className="primary"
@@ -3720,10 +4945,14 @@ function App() {
               if (!roadRoute?.length) return;
               download("strava-art-walk.gpx", gpx(roadRoute, description));
             }}
-            disabled={!hasWalkableRoute}
+            disabled={!hasWalkableRoute || isRouteBusy}
           >
             {t.exportGpx}
           </button>
+
+          {selectedAiDescription ? (
+            <p className="aiShapeDescription">{selectedAiDescription}</p>
+          ) : null}
 
           {routeCandidates.length > 1 ? (
             <div className="candidatePicker" aria-label={t.bestRoutes}>
@@ -3735,14 +4964,27 @@ function App() {
                 {routeCandidates.map((candidate, index) => (
                   <button
                     key={`${candidate.rank}-${index}`}
-                    className={index === selectedCandidateIndex ? "selectedCandidate" : undefined}
+                    className={[
+                      index === selectedCandidateIndex ? "selectedCandidate" : "",
+                      index === hoveredCandidateIndex ? "hoveredCandidate" : "",
+                    ].filter(Boolean).join(" ") || undefined}
                     type="button"
                     onClick={() => selectRouteCandidate(index)}
+                    onFocus={() => setHoveredCandidateIndex(index)}
+                    onBlur={() => setHoveredCandidateIndex(null)}
+                    onPointerEnter={() => setHoveredCandidateIndex(index)}
+                    onPointerLeave={() => setHoveredCandidateIndex(null)}
                   >
                     <strong>#{candidate.rank}</strong>
                     <span>{(candidate.routeDistanceMeters / 1000).toFixed(2)} km</span>
-                    <span>{t.shapeShort} {Math.round(candidate.shapeErrorMeters)}m</span>
-                    <span>{t.worstShort} {Math.round(candidate.worstSegmentErrorMeters)}m</span>
+                    <span>{candidate.aiLabel ?? t.shapeShort + ' ' + Math.round(candidate.shapeErrorMeters) + 'm'}</span>
+                    <span>
+                      {candidate.aiLabel
+                        ? candidate.aiGeneratedSketch
+                          ? t.shapeShort + ' ' + Math.round(candidate.shapeErrorMeters) + 'm'
+                          : Math.round((candidate.aiConfidence ?? 0) * 100) + '%'
+                        : t.worstShort + ' ' + Math.round(candidate.worstSegmentErrorMeters) + 'm'}
+                    </span>
                   </button>
                 ))}
               </div>
@@ -3751,7 +4993,7 @@ function App() {
 
           <p className="status">{roadStatus}</p>
           <p className="status timing">
-            {isMatchingRoads
+            {isRouteBusy
               ? matchPhase || t.calculatingPath
               : matchTiming
                 ? (() => {

@@ -184,6 +184,50 @@ input:focus {
   padding: 11px 12px;
 }
 
+.shapeInputTabs {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+  padding: 4px;
+  border: 1px solid #ded5c5;
+  border-radius: 8px;
+  background: #f5efe3;
+}
+
+.shapeInputTabs button {
+  min-height: 38px;
+  border-color: transparent;
+  background: transparent;
+  color: #556070;
+  font-size: 0.86rem;
+  font-weight: 900;
+}
+
+.shapeInputTabs button:hover {
+  border-color: #d9cdbc;
+  background: #fffdf8;
+  transform: none;
+}
+
+.shapeInputTabs .selectedInputTab {
+  border-color: #fc4c02;
+  color: #ffffff;
+  background: #fc4c02;
+}
+
+.shapeInputTabs .selectedInputTab:hover {
+  background: #fc4c02;
+}
+
+.shapeInputPanel {
+  display: grid;
+  gap: 14px;
+}
+
+.aiOptionsPanel {
+  gap: 12px;
+}
+
 .drawingPad {
   display: grid;
   gap: 8px;
@@ -294,6 +338,57 @@ button:hover {
   background: #fff4e9;
 }
 
+.aiSketchSuggestions {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(52px, 1fr));
+  gap: 6px;
+  margin-top: -4px;
+}
+
+.aiSketchSuggestions button {
+  display: grid;
+  gap: 4px;
+  min-height: 64px;
+  padding: 6px;
+  place-items: center;
+}
+
+.aiSketchSuggestions svg {
+  width: 38px;
+  height: 38px;
+}
+
+.aiSketchSuggestions polyline {
+  fill: none;
+  stroke: #fc4c02;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 7;
+}
+
+.aiSketchSuggestions span {
+  max-width: 100%;
+  overflow: hidden;
+  color: #556070;
+  font-size: 0.68rem;
+  font-weight: 800;
+  text-overflow: ellipsis;
+  text-transform: capitalize;
+  white-space: nowrap;
+}
+
+
+.aiShapeDescription {
+  margin: -4px 0 0;
+  padding: 10px 12px;
+  border: 1px solid rgba(252, 76, 2, 0.24);
+  border-radius: 6px;
+  color: #273043;
+  background: #fff4e9;
+  font-size: 0.84rem;
+  font-weight: 800;
+  line-height: 1.38;
+}
 
 .candidatePicker {
   display: grid;
@@ -340,6 +435,18 @@ button:hover {
   border-color: #fc4c02;
   background: #fff4e9;
 }
+
+.candidateList .hoveredCandidate {
+  border-color: #0e7490;
+  background: #ecfbff;
+  box-shadow: inset 0 0 0 1px rgba(14, 116, 144, 0.22);
+}
+
+.candidateList .selectedCandidate.hoveredCandidate {
+  border-color: #fc4c02;
+  background: #fff0df;
+}
+
 
 .candidateList strong {
   color: #273043;
