@@ -37,6 +37,19 @@ export default defineConfig(({ mode }) => {
           });
           await handler(request, vercelResponse);
         });
+        server.middlewares.use("/api/overpass", async (request, response) => {
+          const { default: handler } = await import("./api/overpass.js");
+          const vercelResponse = Object.assign(response, {
+            status(code: number) {
+              response.statusCode = code;
+              return vercelResponse;
+            },
+            send(payload: string) {
+              response.end(payload);
+            },
+          });
+          await handler(request, vercelResponse);
+        });
       },
     },
   ],

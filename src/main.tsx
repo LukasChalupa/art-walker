@@ -1653,30 +1653,31 @@ function roadTileQuery(tile: RoadTile, profile: RoadQueryProfile) {
 }
 
 async function fetchOverpassData(query: string, profile: RoadQueryProfile): Promise<OverpassRoadData> {
-  let lastError: unknown = null;
+  const endpoint = (import.meta.env.VITE_OVERPASS_API_URL as string | undefined)?.trim() || "/api/overpass";
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), profile.timeoutMs * overpassEndpoints.length + 3_000);
 
-  for (const endpoint of overpassEndpoints) {
-    const controller = new AbortController();
-    const timeout = window.setTimeout(() => controller.abort(), profile.timeoutMs);
+  try {
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        query,
+        timeoutMs: profile.timeoutMs,
+      }),
+      signal: controller.signal,
+    });
 
-    try {
-      const response = await fetch(endpoint, {
-        method: "POST",
-        body: query,
-        signal: controller.signal,
-      });
-      if (!response.ok) throw new Error(`Road search failed at ${endpoint}`);
-      return await response.json() as OverpassRoadData;
-    } catch (error) {
-      lastError = error;
-    } finally {
-      window.clearTimeout(timeout);
+    if (!response.ok) {
+      throw new Error(await apiResponseError(response, "Road search failed. OpenStreetMap road data may be busy; try again in a moment."));
     }
-  }
 
-  throw lastError instanceof Error
-    ? lastError
-    : new Error("Road search failed. OpenStreetMap road data may be busy; try again in a moment.");
+    return await response.json() as OverpassRoadData;
+  } finally {
+    window.clearTimeout(timeout);
+  }
 }
 
 async function fetchRoadTileGraph(tile: RoadTile, profile: RoadQueryProfile) {
