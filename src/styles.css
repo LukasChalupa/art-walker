@@ -417,7 +417,14 @@ button:hover {
   padding-right: 2px;
 }
 
-.candidateList button {
+.candidateItem {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 34px;
+  gap: 6px;
+  align-items: stretch;
+}
+
+.candidateSelect {
   display: grid;
   grid-template-columns: 42px 68px 1fr 1fr;
   gap: 8px;
@@ -427,7 +434,8 @@ button:hover {
   text-align: left;
 }
 
-.candidateList button:hover {
+.candidateSelect:hover,
+.candidateStar:hover {
   transform: none;
 }
 
@@ -447,19 +455,163 @@ button:hover {
   background: #fff0df;
 }
 
+.candidateStar {
+  display: inline-grid;
+  min-width: 34px;
+  min-height: 38px;
+  padding: 0;
+  place-items: center;
+  color: #fc4c02;
+  background: #fffdf8;
+  font-size: 1rem;
+  font-weight: 900;
+  line-height: 1;
+}
+
+.candidateStar.selectedCandidateStar {
+  border-color: #fc4c02;
+  background: #fff4e9;
+}
+
+.candidateStar span {
+  line-height: 1;
+}
 
 .candidateList strong {
   color: #273043;
   font-size: 0.88rem;
 }
 
-.candidateList span {
+.candidateSelect span {
   overflow: hidden;
   color: #6f7886;
   font-size: 0.76rem;
   font-weight: 800;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.savedPaths {
+  display: grid;
+  gap: 8px;
+}
+
+.savedPathItems {
+  display: grid;
+  gap: 6px;
+  max-height: 220px;
+  overflow: auto;
+  padding-right: 2px;
+}
+
+.savedPathItem {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 34px;
+  gap: 6px;
+  align-items: stretch;
+}
+
+.savedPathLoad {
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr) minmax(82px, auto);
+  gap: 8px;
+  align-items: center;
+  min-height: 56px;
+  padding: 7px 8px;
+  text-align: left;
+}
+
+.savedPathLoad:hover,
+.savedPathRemove:hover {
+  transform: none;
+}
+
+.savedPathItem.selectedSavedPath .savedPathLoad {
+  border-color: #fc4c02;
+  background: #fff4e9;
+  box-shadow: inset 0 0 0 1px rgba(252, 76, 2, 0.18);
+}
+
+.savedPathItem.selectedSavedPath .savedPathRemove {
+  border-color: #fc4c02;
+}
+
+.savedPathLoad svg {
+  width: 42px;
+  height: 42px;
+}
+
+.savedPathLoad rect {
+  fill: #fffaf1;
+  stroke: #eadfce;
+  stroke-width: 1;
+}
+
+.savedPathLoad polyline {
+  fill: none;
+  stroke: #fc4c02;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 7;
+}
+
+.savedPathMain,
+.savedPathArea {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.savedPathMain strong,
+.savedPathMain span,
+.savedPathArea strong,
+.savedPathArea span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.savedPathMain strong {
+  color: #273043;
+  font-size: 0.86rem;
+}
+
+.savedPathMain span,
+.savedPathArea span {
+  color: #6f7886;
+  font-size: 0.72rem;
+  font-weight: 800;
+}
+
+.savedPathArea {
+  justify-items: end;
+  text-align: right;
+}
+
+.savedPathArea strong {
+  color: #273043;
+  font-size: 0.78rem;
+}
+
+.savedPathRemove {
+  min-width: 34px;
+  min-height: 56px;
+  padding: 0;
+  color: #6f7886;
+  background: #fffdf8;
+  font-weight: 900;
+}
+
+.savedPathEmpty {
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px dashed #d7cbb9;
+  border-radius: 6px;
+  color: #6f7886;
+  background: #fffdf8;
+  font-size: 0.82rem;
+  font-weight: 700;
+  line-height: 1.35;
 }
 
 .primary {
@@ -633,6 +785,21 @@ button:disabled {
   }
 
   .rangeRow strong {
+    text-align: left;
+  }
+
+  .savedPathLoad {
+    grid-template-columns: 38px minmax(0, 1fr);
+  }
+
+  .savedPathLoad svg {
+    width: 38px;
+    height: 38px;
+  }
+
+  .savedPathArea {
+    grid-column: 2;
+    justify-items: start;
     text-align: left;
   }
 }

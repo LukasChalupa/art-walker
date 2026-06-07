@@ -138,6 +138,19 @@ type SavedLocation = {
   selectedLocation: LocationSuggestion | null;
 };
 
+type SavedPath = {
+  areaSquareMeters: number;
+  createdAt: number;
+  distanceKm: number;
+  fingerprint: string;
+  id: string;
+  locationLabel: string;
+  name: string;
+  pointCount: number;
+  routePoints?: RoutePoint[];
+  shapePoints: Point[];
+};
+
 type ShapeVariant = {
   name: string;
   points: Point[];
@@ -157,6 +170,10 @@ type PlacementCandidate = {
   variantIsAi?: boolean;
 };
 
+type RoadMatchOptions = {
+  startRangeMeters?: number;
+};
+
 type ShapeScore = {
   anchorError: number;
   maxError: number;
@@ -171,6 +188,31 @@ type ShapeSegmentWindow = {
   maxError: number;
   score: number;
   startProgress: number;
+};
+
+type ShapeSeedWindow = {
+  endProgress: number;
+  index: number;
+  length: number;
+  points: Point[];
+  startProgress: number;
+  turnScore: number;
+};
+
+type RoadSeedPath = {
+  length: number;
+  nodes: GraphNode[];
+  points: Point[];
+  qualityPenalty: number;
+  score: number;
+  turnScore: number;
+};
+
+type SeededPlacementMatch = {
+  offset: Point;
+  rotation: number;
+  scale: number;
+  score: number;
 };
 
 type RouteCandidateOption = {
@@ -289,6 +331,7 @@ const translations = {
     walkTime: "Walk time",
     points: "Points",
     bounds: "Bounds",
+    area: "Area",
     routePreview: "Route preview",
     interactiveRouteMap: "Interactive route map",
     calculatingWalkableRoute: "Calculating walkable route...",
@@ -302,6 +345,12 @@ const translations = {
     cachePersistent: "saved",
     cacheNetwork: "network",
     cacheMixed: "mixed",
+    savePath: "Star path",
+    pathSaved: "Starred",
+    popularPaths: "Popular paths",
+    savedPathsEmpty: "Star a walkable route to save its shape.",
+    useSavedPath: "Use saved shape",
+    removeSavedPath: "Remove saved path",
     templateLabels: {
       heart: "heart",
       star: "star",
@@ -342,6 +391,9 @@ const translations = {
       mapyResult: (routeType: string, distanceKm: string, shape: string) => `Mapy.com ${routeType} route planned. GPX distance is ${distanceKm} km.${shape}`,
       roadMatchingFailed: "Road matching failed.",
       slowRoadData: "Showing the generated sketch now. Road data is slow, so use Match roads to retry.",
+      pathSaved: (name: string) => `Saved ${name} to popular paths.`,
+      pathRemoved: (name: string) => `Removed ${name} from saved paths.`,
+      savedPathLoaded: (name: string) => `Selected ${name} as the export target.`,
     },
     progress: {
       resolvingStart: "Resolving start point...",
@@ -408,6 +460,7 @@ const translations = {
     walkTime: "Čas chůze",
     points: "Body",
     bounds: "Rozsah",
+    area: "Plocha",
     routePreview: "Náhled trasy",
     interactiveRouteMap: "Interaktivní mapa trasy",
     calculatingWalkableRoute: "Počítám pěší trasu...",
@@ -421,6 +474,12 @@ const translations = {
     cachePersistent: "uloženo",
     cacheNetwork: "síť",
     cacheMixed: "kombinace",
+    savePath: "Označit trasu",
+    pathSaved: "Uloženo",
+    popularPaths: "Oblíbené trasy",
+    savedPathsEmpty: "Označ pěší trasu hvězdičkou a uloží se její tvar.",
+    useSavedPath: "Použít uložený tvar",
+    removeSavedPath: "Odebrat uloženou trasu",
     templateLabels: {
       heart: "srdce",
       star: "hvězda",
@@ -461,6 +520,9 @@ const translations = {
       mapyResult: (routeType: string, distanceKm: string, shape: string) => `Mapy.com naplánovalo trasu ${routeType}. Délka GPX je ${distanceKm} km.${shape}`,
       roadMatchingFailed: "Napojení na cesty selhalo.",
       slowRoadData: "Zatím zobrazuji vygenerovaný náčrt. Data cest jsou pomalá, zkus Najít cestu znovu.",
+      pathSaved: (name: string) => `${name} je uložená v oblíbených trasách.`,
+      pathRemoved: (name: string) => `${name} je odebraná z uložených tras.`,
+      savedPathLoaded: (name: string) => `${name} je vybraná pro export.`,
     },
     progress: {
       resolvingStart: "Určuji výchozí bod...",
@@ -548,6 +610,8 @@ type TemplateName = typeof templates[number];
 
 const roadGraphCache = new Map<string, RoadGraph>();
 const savedLocationKey = "route-canvas.location";
+const savedPathsKey = "route-canvas.saved-paths";
+const savedPathLimit = 30;
 const roadGraphDbName = "route-canvas-road-graphs";
 const roadGraphStoreName = "roadGraphs";
 const roadGraphCacheMaxAgeMs = 60 * 24 * 60 * 60 * 1000;
@@ -631,6 +695,20 @@ const matchConfig = {
   randomCandidatesPerVariant: 1100,
   randomScaleMin: 0.66,
   randomScaleMax: 1.32,
+  seededPlacementShapeWindows: 9,
+  seededPlacementShapeSamples: 112,
+  seededPlacementTargetWindowMeters: 420,
+  seededPlacementMinWindowSamples: 7,
+  seededPlacementWindowSamples: 18,
+  seededPlacementMinWindowMeters: 120,
+  seededPlacementMaxRoadPathMeters: 900,
+  seededPlacementMaxRoadStarts: 180,
+  seededPlacementRoadBeamWidth: 3,
+  seededPlacementMaxRoadNodes: 44,
+  seededPlacementMaxRoadPathsPerWindow: 360,
+  seededPlacementCandidateLimit: 90,
+  seededPlacementBasePenalty: 30,
+  seededPlacementPenaltyWeight: 0.72,
   routeChoicePoolSize: 8,
   candidateDisplayLimit: 8,
   routeChoiceScoreWindowRatio: 0.1,
@@ -1063,11 +1141,20 @@ function startSearchRadiusMeters(kilometers: number) {
   );
 }
 
-function roadSearchRadiusMeters(points: Point[], kilometers: number, startSearchMeters: number) {
-  const shapeRadius = targetMeters(points, kilometers).reduce(
+function shapeRadiusMeters(points: Point[], kilometers: number) {
+  return targetMeters(points, kilometers).reduce(
     (radius, point) => Math.max(radius, Math.hypot(point.x, point.y)),
     0,
   );
+}
+
+function graphBackedStartSearchRadiusMeters(points: Point[], kilometers: number, graphRadiusMeters: number) {
+  const graphUsableStartRadius = graphRadiusMeters - shapeRadiusMeters(points, kilometers) - matchConfig.roadTileQueryOverlapMeters;
+  return Math.max(startSearchRadiusMeters(kilometers), graphUsableStartRadius);
+}
+
+function roadSearchRadiusMeters(points: Point[], kilometers: number, startSearchMeters: number) {
+  const shapeRadius = shapeRadiusMeters(points, kilometers);
 
   return Math.min(
     Math.max(
@@ -2151,6 +2238,217 @@ function repairTargetsForWindows(targetPoints: Point[], windows: ShapeSegmentWin
         || localDistance(sample.point, previous.point) > 1;
     })
     .map((sample) => sample.point);
+}
+
+function seededShapeWindows(points: Point[]): ShapeSeedWindow[] {
+  const totalLength = distance(points);
+  if (points.length < 2 || totalLength < matchConfig.seededPlacementMinWindowMeters) return [];
+
+  const sampleCount = Math.max(
+    matchConfig.seededPlacementShapeSamples,
+    matchConfig.seededPlacementShapeWindows * matchConfig.seededPlacementMinWindowSamples,
+  );
+  const sampled = resample(points, sampleCount);
+  const maxWindowSamples = Math.max(
+    matchConfig.seededPlacementMinWindowSamples,
+    Math.floor(sampled.length * 0.32),
+  );
+  const windowSamples = Math.min(
+    maxWindowSamples,
+    Math.max(
+      matchConfig.seededPlacementMinWindowSamples,
+      Math.round(sampled.length * matchConfig.seededPlacementTargetWindowMeters / Math.max(totalLength, 1)),
+    ),
+  );
+  const windowCount = Math.min(
+    matchConfig.seededPlacementShapeWindows,
+    Math.max(1, sampled.length - windowSamples + 1),
+  );
+  const step = windowCount <= 1 ? 0 : (sampled.length - windowSamples) / (windowCount - 1);
+  const windows: ShapeSeedWindow[] = [];
+
+  for (let index = 0; index < windowCount; index += 1) {
+    const startIndex = Math.round(index * step);
+    const endIndex = Math.min(sampled.length - 1, startIndex + windowSamples - 1);
+    const windowPoints = sampled.slice(startIndex, endIndex + 1);
+    const length = distance(windowPoints);
+    if (windowPoints.length < 3 || length < matchConfig.seededPlacementMinWindowMeters) continue;
+
+    windows.push({
+      endProgress: endIndex / Math.max(sampled.length - 1, 1),
+      index,
+      length,
+      points: windowPoints,
+      startProgress: startIndex / Math.max(sampled.length - 1, 1),
+      turnScore: routeTurnScore(resample(windowPoints, Math.min(matchConfig.seededPlacementWindowSamples, windowPoints.length))),
+    });
+  }
+
+  return windows;
+}
+
+function roadSeedStartNodes(graph: RoadGraph) {
+  const candidates = graph.nodeGrid.nodes.filter((node) => nodeDegree(graph, node.id) >= 2);
+  const nodes = candidates.length ? candidates : graph.nodeGrid.nodes;
+  if (nodes.length <= matchConfig.seededPlacementMaxRoadStarts) return nodes;
+
+  const selected: GraphNode[] = [];
+  const stride = nodes.length / matchConfig.seededPlacementMaxRoadStarts;
+  for (let index = 0; index < matchConfig.seededPlacementMaxRoadStarts; index += 1) {
+    selected.push(nodes[Math.floor(index * stride)]);
+  }
+  return selected;
+}
+
+function roadSeedPathSignature(nodes: GraphNode[]) {
+  const stride = Math.max(1, Math.floor(nodes.length / 5));
+  return nodes
+    .filter((_, index) => index === 0 || index === nodes.length - 1 || index % stride === 0)
+    .map((node) => node.id)
+    .join('>');
+}
+
+function roadSeedPathsForWindow(graph: RoadGraph, targetLength: number): RoadSeedPath[] {
+  const minLength = Math.max(matchConfig.seededPlacementMinWindowMeters, targetLength * matchConfig.randomScaleMin);
+  const maxLength = Math.min(
+    matchConfig.seededPlacementMaxRoadPathMeters,
+    Math.max(minLength + matchConfig.roadNodeSpacingMeters, targetLength * matchConfig.randomScaleMax),
+  );
+  const starts = roadSeedStartNodes(graph);
+  const paths: RoadSeedPath[] = [];
+  const seen = new Set<string>();
+
+  function addPath(nodes: GraphNode[], length: number) {
+    const signature = roadSeedPathSignature(nodes);
+    if (seen.has(signature)) return;
+    seen.add(signature);
+
+    const points = nodes.map((node) => ({ x: node.x, y: node.y }));
+    const turnScore = routeTurnScore(resample(points, Math.min(matchConfig.seededPlacementWindowSamples, points.length)));
+    const qualityPenalty = routeQualityPenalty(graph, nodes).penalty;
+    const lengthPenalty = Math.abs(length - targetLength) / Math.max(targetLength, 1) * 90;
+
+    paths.push({
+      length,
+      nodes,
+      points,
+      qualityPenalty,
+      score: lengthPenalty + qualityPenalty * 0.04 - Math.min(turnScore, 8) * 1.2,
+      turnScore,
+    });
+  }
+
+  function prunePaths() {
+    if (paths.length <= matchConfig.seededPlacementMaxRoadPathsPerWindow * 3) return;
+    paths.sort((a, b) => a.score - b.score);
+    paths.length = matchConfig.seededPlacementMaxRoadPathsPerWindow * 2;
+  }
+
+  starts.forEach((start) => {
+    const firstEdges = (graph.edges.get(start.id) ?? [])
+      .flatMap((edge) => {
+        const next = graph.nodes.get(edge.to);
+        return next ? [{ edge, next }] : [];
+      });
+
+    firstEdges.forEach(({ edge, next }) => {
+      let beam = [{
+        length: edge.weight,
+        nodes: [start, next],
+        score: 0,
+      }];
+
+      for (let depth = 0; depth < matchConfig.seededPlacementMaxRoadNodes && beam.length; depth += 1) {
+        const nextBeam: Array<{ length: number; nodes: GraphNode[]; score: number }> = [];
+
+        beam.forEach((state) => {
+          if (state.length >= minLength) addPath(state.nodes, state.length);
+          if (state.length >= maxLength) return;
+
+          const current = state.nodes[state.nodes.length - 1];
+          const previous = state.nodes[state.nodes.length - 2];
+          const choices = (graph.edges.get(current.id) ?? [])
+            .flatMap((nextEdge) => {
+              const nextNode = graph.nodes.get(nextEdge.to);
+              return nextNode ? [{ edge: nextEdge, next: nextNode }] : [];
+            })
+            .filter(({ next: nextNode }) => nextNode.id !== previous?.id && !state.nodes.some((node) => node.id === nextNode.id));
+
+          choices
+            .map(({ edge: nextEdge, next: nextNode }) => {
+              const turnPenalty = previous ? Math.max(0, turnRadians(previous, current, nextNode) - Math.PI * 0.82) * 120 : 0;
+              const deadEndPenalty = isDeadEndNode(graph, nextNode.id) ? 35 : 0;
+              const overshootPenalty = Math.max(0, state.length + nextEdge.weight - maxLength) * 0.35;
+              return {
+                length: state.length + nextEdge.weight,
+                nodes: [...state.nodes, nextNode],
+                score: state.score + turnPenalty + deadEndPenalty + overshootPenalty,
+              };
+            })
+            .sort((a, b) => a.score - b.score)
+            .slice(0, matchConfig.seededPlacementRoadBeamWidth)
+            .forEach((state) => nextBeam.push(state));
+        });
+
+        beam = nextBeam
+          .sort((a, b) => a.score - b.score)
+          .slice(0, matchConfig.seededPlacementRoadBeamWidth);
+      }
+
+      prunePaths();
+    });
+  });
+
+  return paths
+    .sort((a, b) => a.score - b.score)
+    .slice(0, matchConfig.seededPlacementMaxRoadPathsPerWindow);
+}
+
+function scoreSeededPlacement(window: ShapeSeedWindow, path: RoadSeedPath): SeededPlacementMatch | null {
+  if (window.points.length < 3 || path.points.length < 3) return null;
+
+  const shapeStart = window.points[0];
+  const shapeEnd = window.points[window.points.length - 1];
+  const roadStart = path.points[0];
+  const roadEnd = path.points[path.points.length - 1];
+  const shapeChord = localDistance(shapeStart, shapeEnd);
+  const roadChord = localDistance(roadStart, roadEnd);
+  if (shapeChord < 18 || roadChord < 18) return null;
+
+  const scale = path.length / Math.max(window.length, 1);
+  if (scale < matchConfig.randomScaleMin || scale > matchConfig.randomScaleMax) return null;
+
+  const shapeHeading = Math.atan2(shapeEnd.y - shapeStart.y, shapeEnd.x - shapeStart.x);
+  const roadHeading = Math.atan2(roadEnd.y - roadStart.y, roadEnd.x - roadStart.x);
+  const rotation = Math.atan2(Math.sin(roadHeading - shapeHeading), Math.cos(roadHeading - shapeHeading));
+  const cos = Math.cos(rotation);
+  const sin = Math.sin(rotation);
+  const offset = {
+    x: roadStart.x - (shapeStart.x * cos - shapeStart.y * sin) * scale,
+    y: roadStart.y - (shapeStart.x * sin + shapeStart.y * cos) * scale,
+  };
+  const transformedWindow = transformPointsWithTrig(window.points, scale, cos, sin, offset);
+  const shapeSample = resample(transformedWindow, matchConfig.seededPlacementWindowSamples);
+  const roadSample = resample(path.points, matchConfig.seededPlacementWindowSamples);
+  const shapeToRoad = averagePolylineDistance(shapeSample, roadSample);
+  const roadToShape = averagePolylineDistance(roadSample, shapeSample);
+  const orderedError = shapeSample.reduce((total, point, index) => (
+    total + localDistance(point, roadSample[Math.min(index, roadSample.length - 1)])
+  ), 0) / Math.max(shapeSample.length, 1);
+  const turnMismatch = Math.abs(window.turnScore - path.turnScore);
+  const chordRatio = roadChord / Math.max(shapeChord * scale, 1);
+  const chordPenalty = Math.abs(Math.log(Math.max(chordRatio, 0.001))) * 28;
+  const scalePenalty = Math.abs(scale - 1) * 26;
+  const score = shapeToRoad * 0.55
+    + roadToShape * 0.45
+    + orderedError * 0.35
+    + turnMismatch * 8
+    + chordPenalty
+    + scalePenalty
+    + path.qualityPenalty * 0.025;
+
+  if (!Number.isFinite(score)) return null;
+  return { offset, rotation, scale, score };
 }
 
 function edgeKey(from: string, to: string) {
@@ -3384,8 +3682,9 @@ async function roadMatchedRoute(
     scoringPlacements: translations.en.progress.scoringPlacements,
     stitching: translations.en.progress.stitching,
   },
+  options: RoadMatchOptions = {},
 ) {
-  const startRangeMeters = startSearchRadiusMeters(kilometers);
+  const startRangeMeters = options.startRangeMeters ?? startSearchRadiusMeters(kilometers);
   const targetDistanceMeters = kilometers * 1000;
   const segmentBudgetMeters = Math.max(matchConfig.minSegmentBudgetMeters, targetDistanceMeters / matchConfig.segmentBudgetDivisor);
   const scales = matchConfig.scales;
@@ -3417,6 +3716,36 @@ async function roadMatchedRoute(
     await waitForPaint();
   }
 
+  function createPlacedRawCandidate(
+    variant: ShapeVariant,
+    baseTargets: Point[],
+    scoringTargets: Point[],
+    baseCoarseTargets: Point[],
+    scale: number,
+    rotation: number,
+    offset: Point,
+    shapePenalty: number,
+  ): RawPlacementCandidate {
+    const cos = Math.cos(rotation);
+    const sin = Math.sin(rotation);
+    const transformedStart = transformPointWithTrig(baseTargets[0], scale, cos, sin, offset);
+
+    return {
+      baseTargets,
+      coarseTargets: transformPointsWithTrig(baseCoarseTargets, scale, cos, sin, offset),
+      offset,
+      rotation,
+      scale,
+      scoringTargets,
+      startDrift: Math.hypot(transformedStart.x, transformedStart.y),
+      shapePenalty,
+      rotationPenalty: rotationPreferencePenalty(rotation),
+      variantDescription: variant.description,
+      variantIsAi: variant.aiGeneratedSketch,
+      variantName: variant.name,
+    };
+  }
+
   function createRawCandidate(
     variant: ShapeVariant,
     baseTargets: Point[],
@@ -3439,20 +3768,16 @@ async function roadMatchedRoute(
       y: startAnchor.y - rotatedStart.y,
     };
 
-    return {
+    return createPlacedRawCandidate(
+      variant,
       baseTargets,
-      coarseTargets: transformPointsWithTrig(baseCoarseTargets, scale, cos, sin, offset),
-      offset,
-      rotation,
-      scale,
       scoringTargets,
-      startDrift: Math.hypot(startAnchor.x, startAnchor.y),
+      baseCoarseTargets,
+      scale,
+      rotation,
+      offset,
       shapePenalty,
-      rotationPenalty: rotationPreferencePenalty(rotation),
-      variantDescription: variant.description,
-      variantIsAi: variant.aiGeneratedSketch,
-      variantName: variant.name,
-    };
+    );
   }
 
   function materializePlacementCandidate(candidate: RawPlacementCandidate): PlacementCandidate {
@@ -3465,6 +3790,75 @@ async function roadMatchedRoute(
       primaryTargets: transformPointsWithTrig(scoringTargets, scale, cos, sin, offset),
       targets: transformPointsWithTrig(baseTargets, scale, cos, sin, offset),
     };
+  }
+
+  const roadSeedPathCache = new Map<string, RoadSeedPath[]>();
+
+  function cachedRoadSeedPaths(windowLength: number) {
+    const bucket = Math.round(windowLength / 80) * 80;
+    const key = String(Math.max(matchConfig.seededPlacementMinWindowMeters, bucket));
+    const cached = roadSeedPathCache.get(key);
+    if (cached) return cached;
+
+    const paths = roadSeedPathsForWindow(graph, Number(key));
+    roadSeedPathCache.set(key, paths);
+    return paths;
+  }
+
+  function addSeededPlacementCandidates(
+    variant: ShapeVariant,
+    baseTargets: Point[],
+    scoringTargets: Point[],
+    baseCoarseTargets: Point[],
+  ) {
+    const windows = seededShapeWindows(baseTargets);
+    if (!windows.length) return;
+
+    const matches: SeededPlacementMatch[] = [];
+    const perWindowLimit = Math.max(4, Math.ceil(matchConfig.seededPlacementCandidateLimit / windows.length));
+
+    windows.forEach((window) => {
+      cachedRoadSeedPaths(window.length)
+        .flatMap((path) => {
+          const match = scoreSeededPlacement(window, path);
+          return match ? [match] : [];
+        })
+        .sort((a, b) => a.score - b.score)
+        .slice(0, perWindowLimit)
+        .forEach((match) => matches.push(match));
+    });
+
+    const seen = new Set<string>();
+    let added = 0;
+    matches
+      .sort((a, b) => a.score - b.score)
+      .some((match) => {
+        if (added >= matchConfig.seededPlacementCandidateLimit) return true;
+
+        const key = [
+          Math.round(match.scale * 1000),
+          Math.round(match.rotation * 180 / Math.PI),
+          Math.round(match.offset.x / 25),
+          Math.round(match.offset.y / 25),
+        ].join('|');
+        if (seen.has(key)) return false;
+        seen.add(key);
+
+        rawCandidates.push(createPlacedRawCandidate(
+          variant,
+          baseTargets,
+          scoringTargets,
+          baseCoarseTargets,
+          match.scale,
+          match.rotation,
+          match.offset,
+          variant.penalty
+            + matchConfig.seededPlacementBasePenalty
+            + Math.max(0, match.score) * matchConfig.seededPlacementPenaltyWeight,
+        ));
+        added += 1;
+        return false;
+      });
   }
 
   variants.forEach((variant) => {
@@ -3488,6 +3882,8 @@ async function roadMatchedRoute(
         }
       }
     }
+
+    addSeededPlacementCandidates(variant, baseTargets, scoringTargets, baseCoarseTargets);
 
     for (let index = 0; index < matchConfig.randomCandidatesPerVariant; index += 1) {
       const scale = matchConfig.randomScaleMin + Math.random() * (matchConfig.randomScaleMax - matchConfig.randomScaleMin);
@@ -3965,6 +4361,157 @@ function loadSavedLocation(): SavedLocation {
   }
 }
 
+function finiteSavedPoint(value: unknown): Point | null {
+  if (!value || typeof value !== "object") return null;
+
+  const point = value as Partial<Point>;
+  const x = Number(point.x);
+  const y = Number(point.y);
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+
+  return { x, y };
+}
+
+function finiteSavedRoutePoint(value: unknown): RoutePoint | null {
+  if (!value || typeof value !== "object") return null;
+
+  const point = value as Partial<RoutePoint>;
+  const x = Number(point.x);
+  const y = Number(point.y);
+  const lat = Number(point.lat);
+  const lng = Number(point.lng);
+  if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+
+  return { x, y, lat, lng };
+}
+
+function savedPathFromUnknown(value: unknown): SavedPath | null {
+  if (!value || typeof value !== "object") return null;
+
+  const record = value as Record<string, unknown>;
+  const shapePoints = Array.isArray(record.shapePoints)
+    ? record.shapePoints.map(finiteSavedPoint).filter((point): point is Point => Boolean(point))
+    : [];
+  const routePoints = Array.isArray(record.routePoints)
+    ? record.routePoints.map(finiteSavedRoutePoint).filter((point): point is RoutePoint => Boolean(point))
+    : [];
+  if (shapePoints.length < 2) return null;
+
+  const id = typeof record.id === "string" && record.id.trim() ? record.id : "saved-" + String(record.createdAt ?? Date.now());
+  const fingerprint = typeof record.fingerprint === "string" && record.fingerprint.trim() ? record.fingerprint : id;
+  const name = typeof record.name === "string" && record.name.trim() ? record.name.trim().slice(0, 48) : "saved path";
+  const locationLabel = typeof record.locationLabel === "string" && record.locationLabel.trim()
+    ? record.locationLabel.trim().slice(0, 80)
+    : "Unknown location";
+  const areaSquareMeters = Math.max(0, Number(record.areaSquareMeters) || 0);
+  const distanceKm = Math.max(0, Number(record.distanceKm) || 0);
+  const createdAt = Number(record.createdAt);
+  const pointCount = Math.max(0, Math.round(Number(record.pointCount) || shapePoints.length));
+
+  return {
+    areaSquareMeters,
+    createdAt: Number.isFinite(createdAt) ? createdAt : Date.now(),
+    distanceKm,
+    fingerprint,
+    id,
+    locationLabel,
+    name,
+    pointCount,
+    routePoints: routePoints.length >= 2 ? routePoints : undefined,
+    shapePoints: normalize(shapePoints),
+  };
+}
+
+function sortSavedPaths(paths: SavedPath[]) {
+  return [...paths].sort((a, b) => b.areaSquareMeters - a.areaSquareMeters || b.createdAt - a.createdAt);
+}
+
+function loadSavedPaths(): SavedPath[] {
+  if (typeof window === "undefined") return [];
+
+  try {
+    const saved = window.localStorage.getItem(savedPathsKey);
+    if (!saved) return [];
+
+    const parsed = JSON.parse(saved);
+    if (!Array.isArray(parsed)) return [];
+
+    return sortSavedPaths(
+      parsed.map(savedPathFromUnknown).filter((path): path is SavedPath => Boolean(path)),
+    ).slice(0, savedPathLimit);
+  } catch {
+    return [];
+  }
+}
+
+function routeAreaSquareMeters(points: RoutePoint[]) {
+  if (points.length < 2) return 0;
+
+  const center = {
+    lat: points.reduce((total, point) => total + point.lat, 0) / points.length,
+    lng: points.reduce((total, point) => total + point.lng, 0) / points.length,
+  };
+  const local = points.map((point) => toMeters(point, center));
+  const routeBounds = boundsOf(local);
+  const width = Math.max(0, routeBounds.maxX - routeBounds.minX);
+  const height = Math.max(0, routeBounds.maxY - routeBounds.minY);
+
+  return width * height;
+}
+
+function routeShapePoints(points: RoutePoint[]) {
+  const local = points
+    .map((point) => ({ x: point.x, y: point.y }))
+    .filter((point) => Number.isFinite(point.x) && Number.isFinite(point.y));
+  if (local.length < 2) return [];
+
+  return normalize(resample(local, Math.min(160, Math.max(16, local.length))));
+}
+
+function savedRoutePoints(points: RoutePoint[]) {
+  return points
+    .filter((point) => (
+      Number.isFinite(point.x)
+      && Number.isFinite(point.y)
+      && Number.isFinite(point.lat)
+      && Number.isFinite(point.lng)
+    ))
+    .map((point) => ({
+      x: point.x,
+      y: point.y,
+      lat: point.lat,
+      lng: point.lng,
+    }));
+}
+
+function savedPathRoute(path: SavedPath, fallbackCenter: LatLng) {
+  if (path.routePoints?.length && path.routePoints.length >= 2) return path.routePoints;
+
+  return projectToLatLng(path.shapePoints, fallbackCenter, Math.max(path.distanceKm, 0.1));
+}
+
+function savedPathFingerprint(points: RoutePoint[]) {
+  if (points.length < 2) return "";
+
+  const sampleCount = Math.min(18, points.length);
+  return Array.from({ length: sampleCount }, (_, index) => {
+    const sourceIndex = sampleCount === 1 ? 0 : Math.round(index * (points.length - 1) / (sampleCount - 1));
+    const point = points[sourceIndex];
+    return point.lat.toFixed(5) + "," + point.lng.toFixed(5);
+  }).join("|");
+}
+
+function formatArea(squareMeters: number, language: Language) {
+  const locale = language === "cs" ? "cs-CZ" : "en-US";
+  if (squareMeters >= 1_000_000) {
+    return (squareMeters / 1_000_000).toLocaleString(locale, {
+      maximumFractionDigits: squareMeters >= 10_000_000 ? 1 : 2,
+    }) + " km2";
+  }
+
+  return Math.round(squareMeters).toLocaleString(locale) + " m2";
+}
+
 function waitForPaint() {
   return new Promise<void>((resolve) => {
     window.requestAnimationFrame(() => resolve());
@@ -4080,6 +4627,8 @@ function App() {
   const [isSearchingLocations, setIsSearchingLocations] = useState(false);
   const [isLocationFocused, setIsLocationFocused] = useState(false);
   const [distanceKm, setDistanceKm] = useState(5);
+  const [savedPaths, setSavedPaths] = useState<SavedPath[]>(loadSavedPaths);
+  const [selectedSavedPathId, setSelectedSavedPathId] = useState<string | null>(null);
   const [aiShapeQuery, setAiShapeQuery] = useState(loadSavedAiShapeQuery);
   const [aiSketchSuggestions, setAiSketchSuggestions] = useState<ShapeVariant[]>([]);
   const [shapeInputMode, setShapeInputMode] = useState<ShapeInputMode>("draw");
@@ -4173,6 +4722,7 @@ function App() {
   const hasWalkableRoute = Boolean(roadRoute?.length);
   const route = roadRoute?.length ? roadRoute : sketchRoute;
   const selectedRouteCandidate = routeCandidates[selectedCandidateIndex] ?? null;
+  const popularSavedPaths = useMemo(() => sortSavedPaths(savedPaths), [savedPaths]);
   const selectedAiDescription = selectedRouteCandidate?.aiLabel && selectedRouteCandidate.aiDescription
     ? selectedRouteCandidate.aiGeneratedSketch
       ? t.aiSketchDescription(selectedRouteCandidate.aiLabel, selectedRouteCandidate.aiDescription)
@@ -4183,7 +4733,6 @@ function App() {
       )
     : "";
   const startSearchMeters = startSearchRadiusMeters(distanceKm);
-  const matchTryCount = routePlacementTryCount(sourceVariants.length, startSearchMeters);
   const stats = routeStats(route);
   const bounds = {
     north: Math.max(...route.map((point) => point.lat)),
@@ -4200,6 +4749,7 @@ function App() {
 
   function clearRoadMatch() {
     matchRequestRef.current += 1;
+    setSelectedSavedPathId(null);
     setRoadRoute(null);
     setTargetRoute(null);
     setRouteCandidates([]);
@@ -4303,6 +4853,7 @@ function App() {
     const candidate = candidates[index];
     if (!candidate) return;
 
+    setSelectedSavedPathId(null);
     setSelectedCandidateIndex(index);
     setRoadRoute(candidate.points);
     setTargetRoute(candidate.targetPoints);
@@ -4317,6 +4868,94 @@ function App() {
         worstSegmentErrorMeters: candidate.worstSegmentErrorMeters,
       }
       : current);
+  }
+
+  function candidatePathName(candidate: RouteCandidateOption) {
+    return (candidate.aiLabel || activeAiShape?.name || description || `${t.route} #${candidate.rank}`).trim().slice(0, 48);
+  }
+
+  function currentLocationLabel() {
+    if (selectedLocation?.label) return shortLocationLabel(selectedLocation.label);
+    return location.trim() || coordinateLabel(center);
+  }
+
+  function savedPathForRoute(points: RoutePoint[]) {
+    const fingerprint = savedPathFingerprint(points);
+    return fingerprint ? savedPaths.find((path) => path.fingerprint === fingerprint) ?? null : null;
+  }
+
+  function handleToggleSavedPath(candidate: RouteCandidateOption) {
+    const fingerprint = savedPathFingerprint(candidate.points);
+    if (!fingerprint) return;
+
+    const existing = savedPaths.find((path) => path.fingerprint === fingerprint);
+    if (existing) {
+      setSavedPaths((paths) => sortSavedPaths(paths.filter((path) => path.id !== existing.id)).slice(0, savedPathLimit));
+      setRoadStatus(t.status.pathRemoved(existing.name));
+      return;
+    }
+
+    const shapePoints = routeShapePoints(candidate.points);
+    if (shapePoints.length < 2) return;
+
+    const name = candidatePathName(candidate);
+    const candidateStats = routeStats(candidate.points);
+    const createdAt = Date.now();
+    const savedPath: SavedPath = {
+      areaSquareMeters: routeAreaSquareMeters(candidate.points),
+      createdAt,
+      distanceKm: candidateStats.kilometers,
+      fingerprint,
+      id: "path-" + createdAt.toString(36) + "-" + fingerprint.slice(0, 8).replace(/[^a-z0-9]/gi, ""),
+      locationLabel: currentLocationLabel(),
+      name,
+      pointCount: candidate.points.length,
+      routePoints: savedRoutePoints(candidate.points),
+      shapePoints,
+    };
+
+    setSavedPaths((paths) => sortSavedPaths([
+      savedPath,
+      ...paths.filter((path) => path.fingerprint !== fingerprint),
+    ]).slice(0, savedPathLimit));
+    setRoadStatus(t.status.pathSaved(name));
+  }
+
+  function selectSavedPath(path: SavedPath) {
+    const selectedRoute = savedPathRoute(path, center);
+
+    matchRequestRef.current += 1;
+    setSelectedSavedPathId(path.id);
+    setShapeInputMode("draw");
+    setDescription(path.name);
+    setDistanceKm(path.distanceKm || distanceKm);
+    setDrawnPath(normalize(path.shapePoints));
+    setActiveAiShape(null);
+    setFinishedDrawingStrokes([]);
+    setDrawingStroke([]);
+    setRoadRoute(selectedRoute);
+    setTargetRoute(null);
+    setRouteCandidates([]);
+    setSelectedCandidateIndex(0);
+    setHoveredCandidateIndex(null);
+    setRoadSegments([]);
+    setCachedRoadTiles([]);
+    roadGraphRef.current = null;
+    setRoadCenter(null);
+    setMatchTiming(null);
+    setGraphInfo(null);
+    setAiSketchSuggestions([]);
+    setMatchPhase("");
+    setIsMatchingRoads(false);
+    setIsFindingShapes(false);
+    setHasLoadedOnce(true);
+    setRoadStatus(t.status.savedPathLoaded(path.name));
+  }
+
+  function removeSavedPath(pathToRemove: SavedPath) {
+    setSavedPaths((paths) => sortSavedPaths(paths.filter((path) => path.id !== pathToRemove.id)).slice(0, savedPathLimit));
+    if (selectedSavedPathId === pathToRemove.id) setSelectedSavedPathId(null);
+    setRoadStatus(t.status.pathRemoved(pathToRemove.name));
   }
 
   useEffect(() => {
@@ -4416,15 +5055,21 @@ function App() {
       }
 
       if (requestId !== matchRequestRef.current) return;
-      const aiMatchTryCount = routePlacementTryCount(aiMatchVariants.length, startSearchMeters);
-      setMatchPhase(t.progress.testingPlacements(aiMatchTryCount, Math.round(startSearchMeters)));
+      const loadedRadiusMeters = roadFetch?.radiusMeters ?? graphInfo?.radiusMeters ?? Math.max(
+        ...aiMatchVariants.map((variant) => roadSearchRadiusMeters(variant.points, distanceKm, startSearchMeters)),
+      );
+      const placementStartMeters = Math.max(
+        ...aiMatchVariants.map((variant) => graphBackedStartSearchRadiusMeters(variant.points, distanceKm, loadedRadiusMeters)),
+      );
+      const aiMatchTryCount = routePlacementTryCount(aiMatchVariants.length, placementStartMeters);
+      setMatchPhase(t.progress.testingPlacements(aiMatchTryCount, Math.round(placementStartMeters)));
       setRoadStatus(t.status.testing(aiMatchTryCount, matchConfig.topCandidates));
       await waitForPaint();
 
       const routeStartedAt = performance.now();
       const matchedResult = await roadMatchedRoute(graph, aiMatchVariants, resolvedCenter, distanceKm, (message) => {
         if (requestId === matchRequestRef.current) setMatchPhase(message);
-      }, progressLabels);
+      }, progressLabels, { startRangeMeters: placementStartMeters });
       const matched = matchedResult.points;
       routeMs = performance.now() - routeStartedAt;
       if (requestId !== matchRequestRef.current) return;
@@ -4601,13 +5246,15 @@ function App() {
       setCachedRoadTiles(roadFetch.tiles);
       if (requestId !== matchRequestRef.current) return;
 
-      setMatchPhase(t.progress.testingPlacements(matchTryCount, Math.round(startSearchMeters)));
-      setRoadStatus(t.status.testing(matchTryCount, matchConfig.topCandidates));
+      const placementStartMeters = graphBackedStartSearchRadiusMeters(sourcePoints, distanceKm, roadFetch.radiusMeters);
+      const placementTryCount = routePlacementTryCount(sourceVariants.length, placementStartMeters);
+      setMatchPhase(t.progress.testingPlacements(placementTryCount, Math.round(placementStartMeters)));
+      setRoadStatus(t.status.testing(placementTryCount, matchConfig.topCandidates));
       await waitForPaint();
       const routeStartedAt = performance.now();
       const matchedResult = await roadMatchedRoute(graph, sourceVariants, resolvedCenter, distanceKm, (message) => {
         if (requestId === matchRequestRef.current) setMatchPhase(message);
-      }, progressLabels);
+      }, progressLabels, { startRangeMeters: placementStartMeters });
       const matched = matchedResult.points;
       routeMs = performance.now() - routeStartedAt;
       if (requestId !== matchRequestRef.current) return;
@@ -4627,7 +5274,7 @@ function App() {
         totalMs: performance.now() - startedAt,
         roadSearchMs,
         routeMs,
-        placements: matchTryCount,
+        placements: placementTryCount,
         rankedRoutes: matchedResult.rankedRoutes,
         selectedRouteRank: matchedResult.selectedRouteRank,
         choicePoolSize: matchedResult.candidates.length,
@@ -4706,6 +5353,10 @@ function App() {
   useEffect(() => {
     window.localStorage.setItem(savedAiShapeQueryKey, aiShapeQuery);
   }, [aiShapeQuery]);
+
+  useEffect(() => {
+    window.localStorage.setItem(savedPathsKey, JSON.stringify(savedPaths));
+  }, [savedPaths]);
 
   useEffect(() => {
     if (!mapElementRef.current || mapRef.current) return undefined;
@@ -5214,35 +5865,99 @@ function App() {
                 <strong>{routeCandidates.length}</strong>
               </div>
               <div className="candidateList">
-                {routeCandidates.map((candidate, index) => (
-                  <button
-                    key={`${candidate.rank}-${index}`}
-                    className={[
-                      index === selectedCandidateIndex ? "selectedCandidate" : "",
-                      index === hoveredCandidateIndex ? "hoveredCandidate" : "",
-                    ].filter(Boolean).join(" ") || undefined}
-                    type="button"
-                    onClick={() => selectRouteCandidate(index)}
-                    onFocus={() => setHoveredCandidateIndex(index)}
-                    onBlur={() => setHoveredCandidateIndex(null)}
-                    onPointerEnter={() => setHoveredCandidateIndex(index)}
-                    onPointerLeave={() => setHoveredCandidateIndex(null)}
-                  >
-                    <strong>#{candidate.rank}</strong>
-                    <span>{(candidate.routeDistanceMeters / 1000).toFixed(2)} km</span>
-                    <span>{candidate.aiLabel ?? t.shapeShort + ' ' + Math.round(candidate.shapeErrorMeters) + 'm'}</span>
-                    <span>
-                      {candidate.aiLabel
-                        ? candidate.aiGeneratedSketch
-                          ? t.shapeShort + ' ' + Math.round(candidate.shapeErrorMeters) + 'm'
-                          : Math.round((candidate.aiConfidence ?? 0) * 100) + '%'
-                        : t.worstShort + ' ' + Math.round(candidate.worstSegmentErrorMeters) + 'm'}
-                    </span>
-                  </button>
-                ))}
+                {routeCandidates.map((candidate, index) => {
+                  const savedCandidatePath = savedPathForRoute(candidate.points);
+
+                  return (
+                    <div className="candidateItem" key={`${candidate.rank}-${index}`}>
+                      <button
+                        className={[
+                          "candidateSelect",
+                          index === selectedCandidateIndex ? "selectedCandidate" : "",
+                          index === hoveredCandidateIndex ? "hoveredCandidate" : "",
+                        ].filter(Boolean).join(" ")}
+                        type="button"
+                        onClick={() => selectRouteCandidate(index)}
+                        onFocus={() => setHoveredCandidateIndex(index)}
+                        onBlur={() => setHoveredCandidateIndex(null)}
+                        onPointerEnter={() => setHoveredCandidateIndex(index)}
+                        onPointerLeave={() => setHoveredCandidateIndex(null)}
+                      >
+                        <strong>#{candidate.rank}</strong>
+                        <span>{(candidate.routeDistanceMeters / 1000).toFixed(2)} km</span>
+                        <span>{candidate.aiLabel ?? t.shapeShort + ' ' + Math.round(candidate.shapeErrorMeters) + 'm'}</span>
+                        <span>
+                          {candidate.aiLabel
+                            ? candidate.aiGeneratedSketch
+                              ? t.shapeShort + ' ' + Math.round(candidate.shapeErrorMeters) + 'm'
+                              : Math.round((candidate.aiConfidence ?? 0) * 100) + '%'
+                            : t.worstShort + ' ' + Math.round(candidate.worstSegmentErrorMeters) + 'm'}
+                        </span>
+                      </button>
+                      <button
+                        className={savedCandidatePath ? "candidateStar selectedCandidateStar" : "candidateStar"}
+                        type="button"
+                        aria-label={savedCandidatePath ? t.removeSavedPath : t.savePath}
+                        aria-pressed={Boolean(savedCandidatePath)}
+                        onClick={() => handleToggleSavedPath(candidate)}
+                        disabled={isRouteBusy}
+                      >
+                        <span aria-hidden="true">{savedCandidatePath ? "★" : "☆"}</span>
+                      </button>
+                    </div>
+                  );
+                })}
               </div>
             </div>
           ) : null}
+
+          <div className="savedPaths" aria-label={t.popularPaths}>
+            <div className="candidateHeader">
+              <span>{t.popularPaths}</span>
+              <strong>{popularSavedPaths.length}</strong>
+            </div>
+            {popularSavedPaths.length ? (
+              <div className="savedPathItems">
+                {popularSavedPaths.map((path) => (
+                  <div
+                    className={path.id === selectedSavedPathId ? "savedPathItem selectedSavedPath" : "savedPathItem"}
+                    key={path.id}
+                  >
+                    <button
+                      className="savedPathLoad"
+                      type="button"
+                      onClick={() => selectSavedPath(path)}
+                      aria-label={t.useSavedPath}
+                      aria-pressed={path.id === selectedSavedPathId}
+                    >
+                      <svg viewBox="0 0 100 100" aria-hidden="true">
+                        <rect x="6" y="6" width="88" height="88" rx="7" />
+                        <polyline points={pathPreviewPoints(path.shapePoints)} />
+                      </svg>
+                      <span className="savedPathMain">
+                        <strong>{path.name}</strong>
+                        <span>{path.locationLabel}</span>
+                      </span>
+                      <span className="savedPathArea">
+                        <strong>{formatArea(path.areaSquareMeters, language)}</strong>
+                        <span>{t.area} · {path.distanceKm.toFixed(2)} km</span>
+                      </span>
+                    </button>
+                    <button
+                      className="savedPathRemove"
+                      type="button"
+                      onClick={() => removeSavedPath(path)}
+                      aria-label={t.removeSavedPath}
+                    >
+                      x
+                    </button>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="savedPathEmpty">{t.savedPathsEmpty}</p>
+            )}
+          </div>
 
           <p className="status">{roadStatus}</p>
           <p className="status timing">
