@@ -565,8 +565,8 @@ const matchConfig = {
   aiShapeMaxRequestCandidates: 24,
   aiShapeTargetConfidenceMin: 0.68,
   aiVectorShapeLimit: 8,
-  aiVectorMatchForwardLimit: 6,
-  aiVectorMatchReverseLimit: 2,
+  aiVectorMatchForwardLimit: 8,
+  aiVectorMatchReverseLimit: 3,
   aiVectorShapeVariantPenalty: 180,
   aiVectorReversePenalty: 90,
   aiShapeWalkOvershootRatio: 1.12,
@@ -588,10 +588,11 @@ const matchConfig = {
   aiShapeMinUniqueNodeRatio: 0.72,
   maxRenderedSegmentMeters: 10,
   targetPoints: 48,
-  topCandidates: 90,
-  rawPreselectCandidates: 120,
-  coarsePlacementSamples: 14,
-  coarsePlacementCandidateLimit: 260,
+  topCandidates: 120,
+  rawPreselectCandidates: 220,
+  coarsePlacementSamples: 20,
+  coarsePlacementCandidateLimit: 520,
+  coarsePlacementVariantLimit: 80,
   minRoadSearchRadiusMeters: 600,
   maxRoadSearchRadiusMeters: 3000,
   roadSearchPaddingMeters: 200,
@@ -648,7 +649,7 @@ const matchConfig = {
   shapeMaxWeight: 3,
   rawCandidateScoreWeight: 0.08,
   segmentScoreWindows: 8,
-  segmentRepairCandidateLimit: 24,
+  segmentRepairCandidateLimit: 30,
   segmentRepairWindowLimit: 2,
   segmentRepairMinErrorMeters: 55,
   segmentRepairExtraPoints: 96,
@@ -656,7 +657,7 @@ const matchConfig = {
   segmentRepairBudgetBoost: 1.18,
   segmentRepairPenalty: 120,
   waypointLookahead: 5,
-  stitchBeamWidth: 5,
+  stitchBeamWidth: 6,
   futureFitLookahead: 4,
   futureFitPenalty: 0.22,
   snapPenaltyWeight: 1.35,
@@ -3560,9 +3561,52 @@ async function roadMatchedRoute(
     }
   }
 
-  const coarsePreselected = coarseScored
-    .sort((a, b) => a.score - b.score)
-    .slice(0, matchConfig.coarsePlacementCandidateLimit);
+  function coarseCandidateKey(candidate: RawPlacementCandidate) {
+    return [
+      candidate.variantName ?? "",
+      candidate.variantDescription ?? "",
+      String(candidate.variantIsAi),
+      String(candidate.shapePenalty),
+    ].join("|");
+  }
+
+  function selectCoarsePlacementCandidates(candidates: MatchedRawPlacementCandidate[]) {
+    const sorted = [...candidates].sort((a, b) => a.score - b.score);
+    const selected: MatchedRawPlacementCandidate[] = [];
+    const selectedKeys = new Set<string>();
+    const perVariantCounts = new Map<string, number>();
+
+    function addCandidate(candidate: MatchedRawPlacementCandidate) {
+      const key = [
+        coarseCandidateKey(candidate),
+        String(candidate.scale),
+        String(candidate.rotation),
+        String(candidate.offset.x),
+        String(candidate.offset.y),
+      ].join("|");
+      if (selectedKeys.has(key) || selected.length >= matchConfig.coarsePlacementCandidateLimit) return;
+
+      selectedKeys.add(key);
+      selected.push(candidate);
+    }
+
+    for (const candidate of sorted) {
+      const variantKey = coarseCandidateKey(candidate);
+      const count = perVariantCounts.get(variantKey) ?? 0;
+      if (count >= matchConfig.coarsePlacementVariantLimit) continue;
+
+      perVariantCounts.set(variantKey, count + 1);
+      addCandidate(candidate);
+    }
+
+    for (const candidate of sorted) {
+      addCandidate(candidate);
+    }
+
+    return selected;
+  }
+
+  const coarsePreselected = selectCoarsePlacementCandidates(coarseScored);
 
   const rawScored: MatchedPlacementCandidate[] = [];
   await reportProgress(progressLabels.scoringPlacements, 0, coarsePreselected.length, true);
